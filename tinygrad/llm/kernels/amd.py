@@ -74,11 +74,12 @@ class Linear(nn.Linear):
     self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
+    supported = self.use_custom_quant and (amd_custom_kernels_supported(self.weight.device) or
+                                           (_device_name(self.weight.device) == "NV" and bool(getenv("NV_Q8_LINEAR", 1))))
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
       if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
+    if self.ggml_type in ((Q4_K, Q5_K, Q6_K) if _device_name(self.weight.device) == "NV" else (Q4_K, Q5_K, Q6_K, IQ4_XS)) and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
@@ -90,15 +91,16 @@ class Linear(nn.Linear):
       return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
-def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
-  return UOp(Ops.CUSTOMI, dtypes.int32, (a.int(), b.int(), c), arg="__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)")
+def _amd_dp4a(a:UOp, b:UOp, c:UOp, cuda:bool=False) -> UOp:
+  return UOp(Ops.CUSTOMI, dtypes.int32, (a.int(), b.int(), c), arg="__dp4a({}, {}, {})" if cuda else
+             "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)")
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, dtypes.uint32, tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg="__builtin_amdgcn_perm({}, {}, {})")
 
-def _amd_load(ptr:UOp, lanes:int|None=None) -> UOp:
+def _amd_load(ptr:UOp, lanes:int|None=None, cuda:bool=False) -> UOp:
   assert ptr.op is Ops.INDEX
-  if lanes is None: return UOp(Ops.CUSTOMI, ptr.dtype, (ptr,), arg="__builtin_nontemporal_load({0})")
+  if lanes is None: return ptr.load() if cuda else UOp(Ops.CUSTOMI, ptr.dtype, (ptr,), arg="__builtin_nontemporal_load({0})")
   buf, coords = ptr.src[0], ptr.src[1:]
   idx = sum((coord*math.prod(buf.shape[i+1:]) for i,coord in enumerate(coords)), UOp.const(0, dtypes.weakint))
   return UOp(Ops.SHRINK, src=(buf.flatten(), idx, UOp.const(lanes, dtypes.weakint))).load(dtype=ptr.dtype)
@@ -132,12 +134,12 @@ def iq4_half_lut(device:str) -> Tensor:
                 dtype=dtypes.float16, device=device).bitcast(dtypes.uint32).contiguous()
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int, cuda:bool=False) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
   x = x.reshape(tokens, groups, 32)
-  group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+  group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True, cuda=cuda) / 127).maximum(1e-8)
   word_lane = lane.minimum(7)
   xs = tuple(x[token, group, word_lane*4+i].float() for i in range(4))
   word = sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
@@ -149,33 +151,40 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
-  q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
+  q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features,
+                                                                    cuda=_device_name(x.device) == "NV"))[:2]
   return q, scale
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
-  chunks = (group_count+31)//32
-  token_output_chunk, lane = UOp.range(out.shape[0]*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
-  token, output, chunk = token_output_chunk // (out_features*chunks), (token_output_chunk//chunks) % out_features, token_output_chunk % chunks
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, cuda:bool=False, token_block:int=1) -> UOp:
+  # token_block > 1: each warp computes several tokens, so the packed weights it loads (identical UOps) are shared by all of them
+  chunks, tokens = (group_count+31)//32, out.shape[0]
+  assert tokens % token_block == 0
+  token_output_chunk, lane = UOp.range(tokens//token_block*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  tblock, output, chunk = token_output_chunk // (out_features*chunks), (token_output_chunk//chunks) % out_features, token_output_chunk % chunks
   group = lane+chunk*32
-  value = group_dot(token, output, group) if group_count % 32 == 0 else \
-    (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  stores = []
+  for j in range(token_block):
+    token = tblock*token_block + j
+    value = group_dot(token, output, group) if group_count % 32 == 0 else \
+      (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    total = warp_reduce(value, full_wave=True, cuda=cuda)
+    stores.append(out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)))
+  return UOp.group(*stores).end(token_output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int, ggml_type:int, cuda:bool=False,
+                         token_block:int=1) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
-    xwords = _amd_load(xq[token, group, 0], 8)
+    xwords = _amd_load(xq[token, group, 0], 8, cuda=cuda)
     if ggml_type in (Q4_K, Q5_K):
       base = (output * in_features//GGML_BLOCK_SIZE + block) * (Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
       qs_base, dot, qsum = base + (4 if ggml_type == Q4_K else 12) + (subgroup//2)*8, UOp.const(0, dtypes.int32), UOp.const(0, dtypes.int32)
       for word_idx in range(8):
         word = (raw[qs_base+word_idx] >> ((subgroup&1)*4).cast(dtypes.uint32)) & 0x0f0f0f0f
         if ggml_type == Q5_K: word |= ((raw[base+4+word_idx] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
-        dot, qsum = _amd_dp4a(word, xwords[word_idx], dot), _amd_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
+        dot, qsum = _amd_dp4a(word, xwords[word_idx], dot, cuda), _amd_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum, cuda)
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
       return (dot.float()*d*scale - qsum.float()*dmin*minimum) * xd[token, group]
     if ggml_type == IQ4_XS:
@@ -190,16 +199,16 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       pos, within = subgroup*32 + word_idx*4, (subgroup*32 + word_idx*4)%128
-      low = _amd_load(raw[base + (pos//128)*64 + within%64], 4) >> ((within//64)*4).cast(dtypes.uint8)
-      high = _amd_load(raw[base + 128 + (pos//128)*32 + within%32], 4) >> ((within//32)*2).cast(dtypes.uint8)
+      low = _amd_load(raw[base + (pos//128)*64 + within%64], 4, cuda=cuda) >> ((within//64)*4).cast(dtypes.uint8)
+      high = _amd_load(raw[base + 128 + (pos//128)*32 + within%32], 4, cuda=cuda) >> ((within//32)*2).cast(dtypes.uint8)
       quant = ((low & 15) | ((high & 3) << 4)).bitcast(dtypes.int8) - 32
       word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
-      dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4])
+      dots[word_idx//4] = _amd_dp4a(word, xwords[word_idx], dots[word_idx//4], cuda)
     scales = [raw[base + 192 + subgroup*2+i].cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
     return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(dbits)
   names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6"}
-  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
+  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type], cuda, token_block)
 
 def _wmma_layout(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   output_waves = 2 if out_features % (32*output_tiles) == 0 else 1
@@ -297,12 +306,14 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  if tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
+  cuda = _device_name(x.device) == "NV"
+  if not cuda and tokens % 16 == 0 and out_features % 16 == 0 and layer.ggml_type in (Q4_K, Q5_K, IQ4_XS):
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
   xq, xd = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
+  token_block = max(b for b in (1, 2, 4, 8, getenv("NV_Q8_TOKEN_BLOCK", 16)) if tokens % b == 0 and b <= getenv("NV_Q8_TOKEN_BLOCK", 16)) if cuda else 1
+  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cuda=cuda, token_block=token_block)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   return run(decode, out, raw, xq.uop, xd.uop)
 
