@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, gated_delta_kernel_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -329,7 +329,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and gated_delta_kernel_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
@@ -506,7 +506,7 @@ class Transformer:
       Tensor.realize(b.conv_state.assign(conv), b.recurrent_state.assign(rec))
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, checkpoint:int|None=None):
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
+    if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
