@@ -69,7 +69,17 @@ class NVPageTableEntry:
 class NVMemoryManager(MemoryManager):
   va_allocator = TLSFAllocator((1 << 44), base=0x1000000000) # global for all devices.
 
-  def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
+  def on_range_mapped(self):
+    inv = self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE
+    inv.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
+    # wait for the invalidate to complete (TRIGGER clears). over a slow link (USB4 eGPU at Gen1) the GPU otherwise
+    # starts work while stale translations for re-used VA ranges are still cached, which MMU faults
+    if getenv("NV_TLB_INVALIDATE_WAIT", 1):
+      st = time.perf_counter()
+      while inv.read() & (1 << 31):
+        if time.perf_counter() - st > 0.1: raise RuntimeError("NV TLB invalidate did not complete")
+
+  def on_range_unmapped(self): self.on_range_mapped()
 
 class NVDev:
   def __init__(self, pci_dev:PCIDevice):
@@ -142,8 +152,8 @@ class NVDev:
     # 5           PTE_64K / PTE_4K                    20:16 / 20:12
     bits, shifts = (56, [12, 21, 29, 38, 47, 56]) if self.mmu_ver == 3 else (48, [12, 21, 29, 38, 47])
 
-    # tail vram reserved for falcon structs
-    self.mm = NVMemoryManager(self, self.vram_size - (64 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
+    # tail vram reserved for falcon structs (64 MB was too little: allocations near the top faulted the GPU)
+    self.mm = NVMemoryManager(self, self.vram_size - (getenv("NV_VRAM_TAIL_MB", 256) << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
       va_base=0, palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]], reserve_ptable=not self.large_bar)
 
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:

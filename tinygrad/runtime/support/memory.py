@@ -223,8 +223,10 @@ class MemoryManager:
       for pte_id in range(pte_idx, pte_idx + pte_cnt):
         assert pt.valid(pte_id), f"PTE not mapped: {pt.entry(pte_id):#x}"
         pt.set_entry(pte_id, paddr=0x0, valid=False)
+    self.on_range_unmapped()
 
   def on_range_mapped(self): pass
+  def on_range_unmapped(self): pass
 
   @classmethod
   def alloc_vaddr(cls, size:int, align=0x1000) -> int:

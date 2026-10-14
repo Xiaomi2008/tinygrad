@@ -331,13 +331,23 @@ def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
   glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
   return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
 
+# beam search allocates fresh copies of every kernel buffer to time candidates. on a small card next to a loaded model that can OOM
+# (e.g. an ~800 MB LM head), so BEAM_MAX_BUF_MB skips beam for such kernels and falls back to hand coded opts
+def _beam_bufs_too_big(ast:UOp) -> bool:
+  # BEAM_MAX_AST_NODES: very large kernels (e.g. the unrolled gated delta scan of a chunked qwen3.5 prefill) take minutes per beam candidate
+  if (max_nodes:=getenv("BEAM_MAX_AST_NODES", 0)) > 0 and (n:=len(ast.toposort())) > max_nodes:
+    if DEBUG >= 1: print(f"beam skipped for a kernel with {n} AST nodes (BEAM_MAX_AST_NODES={max_nodes})")
+    return True
+  if (limit:=getenv("BEAM_MAX_BUF_MB", 0)) <= 0: return False
+  return sum(x.max_numel() * x.dtype.itemsize for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0) > limit << 20
+
 def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.tag is not None: return ast
   k = Scheduler(ast, ren)
   k.convert_loop_to_global()
   if ast.arg is not None and ast.arg.opts_to_apply is not None:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
-  elif beam >= 1:
+  elif beam >= 1 and not _beam_bufs_too_big(ast):
     from tinygrad.codegen.opt.search import beam_search
     rawbufs, var_vals = args_from_ast(ast, ren.target.device)
     # beam search may open devices

@@ -28,7 +28,7 @@ enum {
   CMD_MAP_SYSMEM = 8,     // map system memory
   CMD_SYSMEM_READ = 9,    // bulk read from system memory
   CMD_SYSMEM_WRITE = 10,  // bulk write to system memory
-  CMD_RESIZE_BAR = 11,    // resize bar (noop)
+  CMD_RESIZE_BAR = 11,    // re-map bar
   RESP_OK = 0, RESP_ERR = 1,
 };
 
@@ -226,6 +226,12 @@ static void handle_client(int fd) {
     }
 
     case CMD_RESIZE_BAR:
+      // re-map on demand: the RM firmware reprograms BAR windows mid-boot, established mappings
+      // then read all-ones while a fresh mapping reads the new window (tinygrad issue #18523)
+      if (req.bar >= MAX_BARS) { resp.status = 1; break; }
+      if (g_bars[req.bar].addr) IOConnectUnmapMemory64(g_conn, req.bar, mach_task_self(), g_bars[req.bar].addr);
+      g_bars[req.bar].addr = 0;
+      resp.status = map_bar(req.bar, &resp) ? 1 : 0;
       break;
 
     case CMD_RESET:

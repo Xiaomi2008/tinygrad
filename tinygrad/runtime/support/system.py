@@ -318,6 +318,12 @@ class RemoteMMIOInterface(MMIOInterface):
     sl = index if isinstance(index, slice) else slice(index, index + 1)
     start, stop = (sl.start or 0) * self.el_sz, (sl.stop or len(self)) * self.el_sz
     data = self.dev._bulk_read(self.rd_cmd, self.residx, self.off + start, stop - start)
+    # the RM firmware reprograms BAR windows mid-boot and the established mapping then reads all-ones (issue #18523): re-map and retry
+    if self.rd_cmd == RemoteCmd.MMIO_READ and self.dev.remaps_left > 0 and len(data) >= 8 and data.count(0xff) == len(data):
+      self.dev.remaps_left -= 1
+      if DEBUG >= 1: print(f"remote: all-ones read from bar {self.residx} at {self.off + start:#x}, re-mapping bar ({self.dev.remaps_left} left)")
+      self.dev.resize_bar(self.residx)
+      data = self.dev._bulk_read(self.rd_cmd, self.residx, self.off + start, stop - start)
     result = data if self.fmt == 'B' else list(struct.unpack(f'<{(stop - start) // self.el_sz}{self.fmt}', data))
     return result if isinstance(index, slice) else result[0]
 
@@ -330,6 +336,7 @@ class RemoteMMIOInterface(MMIOInterface):
     return RemoteMMIOInterface(self.dev, self.residx, size or (self.nbytes - offset), fmt or self.fmt, self.off + offset, self.rd_cmd, self.wr_cmd)
 
 class RemotePCIDevice(PCIDevice):
+  remaps_left:int = 0
   _bulk_sent:int = 0
   _bulk_recv:int = 0
   _rpc_count:int = 0
@@ -435,6 +442,7 @@ class APLRemotePCIDevice(RemotePCIDevice):
       time.sleep(0.05)
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
     super().__init__(devpref, "usb4", sock=sock)
+    self.remaps_left = getenv("TINYGPU_BAR_REMAPS", 8)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)

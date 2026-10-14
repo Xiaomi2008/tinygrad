@@ -1,4 +1,4 @@
-import math, time, traceback, signal
+import math, time, traceback, signal, hashlib
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
@@ -63,7 +63,10 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   ret = None
   try:
     st = time.perf_counter()
-    ast, dev = x[1].copy().get_optimized_ast(name_override="test"), x[1].ren.target.device
+    # name each candidate uniquely (deterministic, so the compile cache still hits): with every candidate named "test", a compile reply
+    # for one candidate handed to another (compile server desync) passed the .text.<name> check and poisoned the cache
+    cand_name = "test_" + hashlib.sha256(x[1].ast.key + repr(x[1].applied_opts).encode()).hexdigest()[:12]
+    ast, dev = x[1].copy().get_optimized_ast(name_override=cand_name), x[1].ren.target.device
     prg = to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort() if p.op is Ops.PARAM}), x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[1].src

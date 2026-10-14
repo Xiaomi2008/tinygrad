@@ -696,12 +696,13 @@ class NVDevice(HCQCompiled[NVSignal]):
   def _ensure_has_local_memory(self, required):
     if self.slm_per_thread >= required: return
 
-    self.slm_per_thread, old_slm_per_thread = round_up(required, 32), self.slm_per_thread
-    bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
-    self.shader_local_mem, ok = self._realloc(self.shader_local_mem, round_up(bytes_per_tpc*self.num_tpc_per_gpc*self.num_gpcs, 0x20000))
-
-    # Realloc failed, restore the old value.
-    if not ok: self.slm_per_thread = old_slm_per_thread
+    def tpc_bytes(slm_per_thread:int) -> int: return round_up(round_up(slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
+    new_slm_per_thread = round_up(required, 32)
+    self.shader_local_mem, ok = self._realloc(self.shader_local_mem, round_up(tpc_bytes(new_slm_per_thread)*self.num_tpc_per_gpc*self.num_gpcs, 0x20000))
+    if ok: self.slm_per_thread = new_slm_per_thread
+    # program the window size from what was actually allocated: on a failed realloc the old (smaller) buffer came back, and
+    # advertising the larger size made the next kernels touch unmapped local memory (MMU PDE fault)
+    bytes_per_tpc = tpc_bytes(self.slm_per_thread)
 
     cast(NVComputeQueue, NVComputeQueue().wait(self.timeline_signal, self.timeline_value - 1)) \
                                          .setup(local_mem=self.shader_local_mem.va_addr, local_mem_tpc_bytes=bytes_per_tpc) \
