@@ -67,7 +67,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                reasoning:bool=False, checkpoint:int|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -87,7 +87,7 @@ class Handler(HTTPRequestHandler):
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint):
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
@@ -130,6 +130,13 @@ class Handler(HTTPRequestHandler):
       normalize_messages(body["messages"])
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
       ids: list[int] = self.server.tok.encode(rendered)
+      # checkpoint recurrent state at the end of the last user message: once the next user message arrives, chat templates re-render the
+      # turns after it differently (qwen3.5 drops their thinking blocks), so that is the last point the next request is sure to share
+      checkpoint = None
+      if (last_user:=max((i for i,m in enumerate(body["messages"]) if m.get("role") == "user"), default=None)) is not None:
+        prefix = self.server.tok.encode(self.server.template.render(messages=body["messages"][:last_user+1], tools=body.get("tools"),
+                                                                    add_generation_prompt=False, preserve_thinking=True))
+        if ids[:len(prefix)] == prefix: checkpoint = len(prefix)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
@@ -141,7 +148,7 @@ class Handler(HTTPRequestHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              reasoning=rendered.rstrip().endswith("<think>"), checkpoint=checkpoint)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"

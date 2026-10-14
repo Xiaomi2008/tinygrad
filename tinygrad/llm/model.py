@@ -365,6 +365,10 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
+    # recurrent models: a copy of the recurrent state at a stable point of the prompt (e.g. the end of the last user message), so a
+    # request whose rendering diverges after that point (chat templates drop past thinking blocks) resumes there instead of at 0
+    self._checkpoint_tokens: list[int] = []
+    self._checkpoint_state: list[tuple[Tensor, Tensor]] = []
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
@@ -469,13 +473,33 @@ class Transformer:
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
-    if self.has_recurrent_block:
-      return len(self._cached_tokens) if self._cached_tokens and len(self._cached_tokens) < len(tokens) \
-        and tokens[:len(self._cached_tokens)] == self._cached_tokens else 0
+    if self.has_recurrent_block: return self._recurrent_resume(tokens)[0]
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def _recurrent_resume(self, tokens:list[int]) -> tuple[int, bool]:
+    # (start_pos, restore checkpoint first): recurrent state can't be partially reused after divergence, so resume only where the
+    # state is known: the end of the cached tokens, or the saved checkpoint
+    def extends(prefix:list[int]) -> bool: return 0 < len(prefix) < len(tokens) and tokens[:len(prefix)] == prefix
+    if extends(self._cached_tokens): return len(self._cached_tokens), False
+    if extends(self._checkpoint_tokens): return len(self._checkpoint_tokens), True
+    return 0, False
+
+  def _recurrent_blocks(self) -> list[GatedDeltaNetBlock]: return [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+
+  def _save_checkpoint(self, tokens:list[int]):
+    blocks = self._recurrent_blocks()
+    if not self._checkpoint_state:
+      self._checkpoint_state = [(b.conv_state.clone().realize(), b.recurrent_state.clone().realize()) for b in blocks]
+    else:
+      for b, (conv, rec) in zip(blocks, self._checkpoint_state): Tensor.realize(conv.assign(b.conv_state), rec.assign(b.recurrent_state))
+    self._checkpoint_tokens = list(tokens)
+
+  def _restore_checkpoint(self):
+    for b, (conv, rec) in zip(self._recurrent_blocks(), self._checkpoint_state):
+      Tensor.realize(b.conv_state.assign(conv), b.recurrent_state.assign(rec))
+
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, checkpoint:int|None=None):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
@@ -486,12 +510,18 @@ class Transformer:
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
+    if self.has_recurrent_block:
+      if self._recurrent_resume(tokens)[1]: self._restore_checkpoint()
+      # positions from start_pos on get rewritten, so a checkpoint past that point no longer matches the caches
+      if start_pos < len(self._checkpoint_tokens): self._checkpoint_tokens = []
+    if checkpoint is not None and not (start_pos < checkpoint < len(tokens)): checkpoint = None
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
+      n_toks = min(chunk_size, len(tokens) - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
+      if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < len(tokens): continue
       tokens.append(int(out.item()))
