@@ -4,7 +4,7 @@ from typing import Callable, cast
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod
+from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 BLOCK_M, BLOCK_N, DECODE_HEAD_TILE, WARP_SIZE = 32, 32, 8, 32
@@ -74,6 +74,11 @@ class Linear(nn.Linear):
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+    # generic path too: with a symbolic token count the matmul can't reuse a dequantized weight across the chunk's tokens
+    # (each token re-reads the weights); a static padded shape lets the optimizer upcast over tokens
+    if not isinstance(x.numel(), int) and getenv("LINEAR_PAD_TOKS", 1):
+      # contiguous: otherwise the shrink folds back into the matmul and its kernel loops over the symbolic token count again
+      return super().__call__(x.pad_to(x.max_shape)).contiguous().shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
