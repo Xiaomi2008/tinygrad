@@ -586,17 +586,17 @@ def _quad_reduce(val:UOp, maximum:bool) -> UOp:
     val = val.maximum(other) if maximum else val + other
   return val
 
-def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, valid_kv_len:UOp, q_start:UOp) -> UOp:
+def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, valid_kv_len:UOp, q_start:UOp, tokens:int) -> UOp:
+  # rows are (query head within the KV group, token): row r is token r % tokens, so a KV group's heads share each K/V load
   BH, Tp, S, D = o.shape
   _, B, H_KV, max_ctx, _ = cache.shape
-  gqa = BH // (B*H_KV)
   k, v = cache[0].reshape(B*H_KV, max_ctx, D), cache[1].reshape(B*H_KV, max_ctx, D)
   bh, qt, sp = UOp.range(BH, 0), UOp.range(Tp//16, 1), UOp.range(S, 2)
   lane = UOp.range(WARP_SIZE, 3, axis_type=AxisType.LOCAL)
   hw_lane = (UOp(Ops.CUSTOM, dtypes.int32, (lane.int(),), arg="((int)(threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z))+0*{0})")
              & 31).cast(dtypes.weakint)
   g, t = hw_lane//4, hw_lane%4
-  kvh = bh // gqa
+  kvh = bh
   q0 = qt*16
   scale = LOG2E / math.sqrt(D)
   m, l = _reg((2,), 0, -math.inf), _reg((2,), 1, 0)
@@ -623,7 +623,7 @@ def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, valid_kv_len:UOp
   sc = {}
   for nb in range(2):
     for e in range(4):
-      key, qpos = kbase + nb*8 + t*2 + e%2, q_start + q0 + g + 8*(e//2)
+      key, qpos = kbase + nb*8 + t*2 + e%2, q_start + (q0 + g + 8*(e//2)) % tokens
       sc[(nb, e)] = ((key <= qpos) & (key < valid_kv_len)).where(s_done[nb][e].load()*scale, -math.inf)
   m_old = [m.after(kt)[r].load() for r in range(2)]
   l_old = [l.after(kt)[r].load() for r in range(2)]
@@ -658,20 +658,24 @@ def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, valid_kv_len:UOp
   return UOp.group(*outs).end(bh, qt, sp, lane).sink(arg=KernelInfo(name="flash_attention_nv", opts_to_apply=()))
 
 def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
-  # q (B,H,T,D) with T symbolic or static; returns (B,H,T,D) float
+  # q (B,H,T,D), T symbolic (padded to its max) or static; returns (B,H,T,D) float. The heads of a KV group are packed into the rows.
   T_real, S = q.shape[2], getenv("NV_FA_SPLITS", 32)
-  T_pad = q.max_shape[2] if isinstance(T_real, UOp) else T_real
-  if isinstance(T_real, UOp): q = q.pad_to((*q.shape[:2], T_pad, q.shape[3]))
   B, H, _, D = q.shape
-  o = Tensor.empty(B*H, T_pad, S, D, dtype="float32", device=q.device)
-  ml = Tensor.empty(B*H, T_pad, S, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_nv_flash_attention_kernel, valid_kv_len=_unbind(valid_end), q_start=_unbind(valid_end - T_real))
-  o, ml = Tensor.custom_kernel(o, ml, q.half().reshape(B*H, T_pad, D).contiguous(), assigned_kv, fxn=fxn)[:2]
+  H_KV = cast(int, assigned_kv.shape[2])
+  gqa = H // H_KV
+  T_pad = q.max_shape[2] if isinstance(T_real, UOp) else T_real
+  while (gqa*T_pad) % 16: T_pad += 1
+  padded = isinstance(T_real, UOp) or T_pad != T_real
+  if padded: q = q.pad_to((B, H, T_pad, D))
+  rows = gqa*T_pad
+  o = Tensor.empty(B*H_KV, rows, S, D, dtype="float32", device=q.device)
+  ml = Tensor.empty(B*H_KV, rows, S, 2, dtype="float32", device=q.device)
+  fxn = functools.partial(_nv_flash_attention_kernel, valid_kv_len=_unbind(valid_end), q_start=_unbind(valid_end - T_real), tokens=T_pad)
+  o, ml = Tensor.custom_kernel(o, ml, q.half().reshape(B*H_KV, rows, D).contiguous(), assigned_kv, fxn=fxn)[:2]
   mx, sm = ml[..., 0], ml[..., 1]
-  top = mx.max(-1, keepdim=True)
-  w = (mx - top).exp2()
+  w = (mx - mx.max(-1, keepdim=True)).exp2()
   out = ((o * w.unsqueeze(-1)).sum(2) / (sm * w).sum(-1, keepdim=True)).reshape(B, H, T_pad, D)
-  return out[:, :, :T_real] if isinstance(T_real, UOp) else out
+  return out[:, :, :T_real] if padded else out
 
 # ******** gated delta net: fused recurrent scan ********
 

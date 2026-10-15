@@ -188,8 +188,8 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    # on NV, prefill chunks use the tensor-core flash attention kernel over the KV cache
-    if _device_name(x.device) == "NV" and getenv("NV_FLASH_ATTN", 1) and resolve(T != 1):
+    # on NV, prefill chunks (and decode: a KV group's heads fill the rows) use the tensor-core flash attention kernel over the KV cache
+    if _device_name(x.device) == "NV" and getenv("NV_FLASH_ATTN", 1) and (resolve(T != 1) or getenv("NV_FLASH_DECODE", 1)):
       attn = flash_attention_nv(q, assigned_kv, start_pos+T).cast(x.dtype)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
