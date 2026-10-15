@@ -4,7 +4,7 @@ import subprocess, time, enum, atexit
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, unwrap, fetch, system, _ensure_downloads_dir, DEBUG, flatten, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface, HCQBuffer, hcq_filter_visible_devices
-from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator
+from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, TLSFAllocator
 from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
 
 MAP_FIXED, MAP_FIXED_NOREPLACE = 0x10, 0x100000
@@ -246,7 +246,7 @@ class USBPCIDevice(PCIDevice):
   def resize_bar(self, bar_idx:int): pass # already resized
 
 @dataclasses.dataclass
-class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=0 # noqa: E702
+class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=0; pool_off:int|None=None # noqa: E702
 
 class PCIIfaceBase:
   @property
@@ -263,7 +263,9 @@ class PCIIfaceBase:
     self.dev, self.vram_bar, self.count = dev, vram_bar, len(hcq_filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False, **kwargs) -> HCQBuffer:
-    should_use_sysmem = host or ((cpu_access if self.is_bar_small() else (uncached and cpu_access)) and not force_devmem)
+    # small bar: CPU-visible buffers (command buffers, kernel args) go to host memory unless NV_DEVMEM_CMDS puts them in the bar window
+    small_bar_sysmem = self.is_bar_small() and not getenv("NV_DEVMEM_CMDS", 1)
+    should_use_sysmem = host or ((cpu_access if small_bar_sysmem else (uncached and cpu_access)) and not force_devmem)
 
     # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
     size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
@@ -274,11 +276,35 @@ class PCIIfaceBase:
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
       return HCQBuffer(vaddr, size, meta=PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), view=memview, owner=self.dev)
 
+    if cpu_access and not uncached and self.is_bar_small() and getenv("NV_DEVMEM_CMDS", 1) and (pooled:=self._bar_pool_alloc(size)) is not None: return pooled
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
+    if cpu_access and mapping.paddrs[0][0] + mapping.size > self.pci_dev.bar_info(self.vram_bar)[1]:  # outside the CPU-visible window
+      self.dev_impl.mm.vfree(mapping)
+      return self.alloc(size, host=True, contiguous=contiguous, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
     return HCQBuffer(mapping.va_addr, size, view=barview, meta=PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), owner=self.dev)
 
+  def _bar_pool_alloc(self, size:int) -> HCQBuffer|None:
+    # Small bar with NV_DEVMEM_CMDS: command buffers and kernel args live in VRAM inside the CPU-visible bar window, so the GPU doesn't
+    # fetch them over the link for every kernel. The pool is reserved on first use (device init, before any weights fill the window).
+    if size > (16 << 20): return None
+    if not hasattr(self, "_bar_pool"):
+      pool_size = getenv("NV_DEVMEM_CMDS_MB", 64) << 20
+      mapping = self.dev_impl.mm.valloc(pool_size, contiguous=True)
+      if mapping.paddrs[0][0] + pool_size > self.pci_dev.bar_info(self.vram_bar)[1]:
+        self.dev_impl.mm.vfree(mapping)
+        self._bar_pool = None
+      else:
+        self._bar_pool = (mapping, TLSFAllocator(pool_size), self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=pool_size))
+    if self._bar_pool is None: return None
+    mapping, allocator, view = self._bar_pool
+    try: off = allocator.alloc(size:=round_up(size, 0x1000), 0x1000)
+    except MemoryError: return None
+    return HCQBuffer(mapping.va_addr + off, size, view=view.view(off, size),
+                     meta=PCIAllocationMeta(mapping, True, hMemory=mapping.paddrs[0][0] + off, pool_off=off), owner=self.dev)
+
   def free(self, b:HCQBuffer):
+    if b.owner == self.dev and getattr(b.meta, "pool_off", None) is not None: return self._bar_pool[1].free(b.meta.pool_off)
     if b.owner != self.dev: self.dev.iface.dev_impl.mm.unmap_range(b.va_addr, round_up(b.size, 0x1000))
     if b.owner == self.dev and b.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(b.meta.mapping)
     if b.owner == self.dev and self.is_local() and b.meta.has_cpu_mapping: FileIOInterface.munmap(b.va_addr, b.size)
