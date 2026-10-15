@@ -298,6 +298,94 @@ def _iq4_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, lut:UOp, out_features:i
     return tuple((_half((pair >> (i*16)) & 0xffff)*scale).cast(dtypes.float16) for pair in lut_pairs for i in range(2))
   return _quant_linear_wmma(out, x, out_features, in_features, IQ4_WORDS, layout, dequant, "linear_iq4_xs_f16_wmma")
 
+# ******** NV tensor cores: mma.sync m16n8k16 (fp16 in, fp32 acc), weights dequantized straight into the A fragments ********
+# A = 16 output rows x 16 k (row-major), B = 16 k x 8 tokens, C = 16 outputs x 8 tokens. Per lane: g = lane//4, t = lane%4.
+# a: (g,2t) (g,2t+1) (g+8,2t) (g+8,2t+1) (g,2t+8) (g,2t+9) (g+8,2t+8) (g+8,2t+9); b: (2t,g) (2t+1,g) (2t+8,g) (2t+9,g)
+# c: (g,2t) (g,2t+1) (g+8,2t) (g+8,2t+1)
+CUDA_MMA_ARG = ((8, 16, 16), 'CUDA', 32)
+
+@functools.cache
+def _quant_linear_cuda_mma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int, token_tiles:int,
+                                  output_tiles:int, ksplit:int=1) -> UOp:
+  # one warp: (16*output_tiles) outputs x (8*token_tiles) tokens. Each step stages one 256-weight block of its rows in shared memory
+  # with coalesced loads, then runs the block's 16 k-steps from there. ksplit > 1 splits the blocks across warps; out[..., kchunk]
+  # is summed afterwards.
+  tokens, rows = out.shape[0], 16*output_tiles
+  x = x.reshape(tokens, in_features)
+  tblk, oblk, kchunk = UOp.range(tokens//(8*token_tiles), 0), UOp.range(out_features//rows, 1), UOp.range(ksplit, 4)
+  lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
+  # the hardware lane: mma fragments are defined by it, and the local range may be split across threadIdx.x/y/z in any order
+  # (the & 31 is a UOp so index math knows the lane is in [0, 32): an opaque value forces 64-bit index arithmetic with modulo)
+  hw_lane = (UOp(Ops.CUSTOM, dtypes.int32, (lane.int(),), arg="((int)(threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z))+0*{0})")
+             & 31).cast(dtypes.weakint)
+  g, t = hw_lane//4, hw_lane%4
+  accs = tuple(tuple(UOp.placeholder((4,), dtypes.float32, slot=ot*token_tiles+nt, addrspace=AddrSpace.REG) for nt in range(token_tiles))
+               for ot in range(output_tiles))
+  accs = tuple(tuple(acc.after(acc.store(acc.const_like(0))) for acc in row) for row in accs)
+  blocks_per_row = in_features // GGML_BLOCK_SIZE
+  kb = UOp.range(blocks_per_row // ksplit, 3, AxisType.REDUCE)
+  block = kchunk*(blocks_per_row//ksplit) + kb
+  # stage the block: unit = 32-bit words (Q4_K/Q5_K) or bytes (Q6_K, 210 bytes per block)
+  unit_dtype, W = (dtypes.uint8, Q6_BYTES) if ggml_type == Q6_K else (dtypes.uint32, Q4_WORDS if ggml_type == Q4_K else Q5_WORDS)
+  smem = UOp.placeholder((rows*W,), unit_dtype, slot=64, addrspace=AddrSpace.LOCAL)
+  li = UOp.range(rows*W//WARP_SIZE, 90)
+  idx = li*WARP_SIZE + hw_lane
+  staged = smem.after(kb)[idx].store(raw[(oblk*rows + idx//W)*blocks_per_row*W + block*W + idx%W]).end(li)
+  sm = smem.after(UOp.barrier(staged))
+
+  def row_dequant(r:UOp, sg:int):
+    # f(idx) -> (w[idx], w[idx+1]) as halves, idx even within 32-weight subgroup sg of local row r
+    base = r*W
+    if ggml_type in (Q4_K, Q5_K):
+      d, dmin, scale, minimum = _q5_scales(sm, base, UOp.const(sg, dtypes.weakint))
+      mul, sub = d*scale, dmin*minimum
+      qs_base = base + (4 if ggml_type == Q4_K else 12) + (sg//2)*8
+      def pair(i0:UOp):
+        word = sm[qs_base + i0//4] >> ((i0%4)*8 + (sg&1)*4).cast(dtypes.uint32)
+        if ggml_type == Q5_K: hi = sm[base + 4 + i0//4] >> ((i0%4)*8 + sg).cast(dtypes.uint32)
+        vals = []
+        for i in range(2):
+          q = (word >> (8*i)) & 15
+          if ggml_type == Q5_K: q = q | (((hi >> (8*i)) & 1) << 4)
+          vals.append((q.float()*mul - sub).cast(dtypes.float16))
+        return vals
+      return pair
+    d = _half(sm[base+208].cast(dtypes.uint16) | (sm[base+209].cast(dtypes.uint16) << 8))
+    def pair(i0:UOp):
+      vals = []
+      for i in range(2):
+        k = sg*32 + i0 + i  # within the 256-weight block
+        within = k % 128
+        low = sm[base + (k//128)*64 + within%64] >> ((within//64)*4).cast(dtypes.uint8)
+        high = sm[base + 128 + (k//128)*32 + within%32] >> ((within//32)*2).cast(dtypes.uint8)
+        q = ((low & 15) | ((high & 3) << 4)).cast(dtypes.int32) - 32
+        vals.append((q.float()*sm[base + 192 + k//16].bitcast(dtypes.int8).float()*d).cast(dtypes.float16))
+      return vals
+    return pair
+
+  wmma_accs = [[acc.after(kb) for acc in row] for row in accs]
+  for sg in range(8):
+    for h in range(2):
+      k0 = h*16 + t*2  # within the subgroup
+      kk = block*GGML_BLOCK_SIZE + sg*32 + k0
+      bfrags = [UOp.stack(*(x[tblk*(8*token_tiles) + nt*8 + g, kk+o] for o in (0, 1, 8, 9))) for nt in range(token_tiles)]
+      for ot in range(output_tiles):
+        p0, p1 = row_dequant(ot*16 + g, sg), row_dequant(ot*16 + g + 8, sg)
+        afrag = UOp.stack(*p0(k0), *p1(k0), *p0(k0+8), *p1(k0+8))
+        for nt in range(token_tiles):
+          wmma_accs[ot][nt] = UOp.wmma(afrag, bfrags[nt], wmma_accs[ot][nt], *CUDA_MMA_ARG)
+  update = UOp.group(*(acc.store(v) for row,vrow in zip(accs, wmma_accs) for acc,v in zip(row, vrow))).barrier().end(kb)
+  stores = []
+  for ot in range(output_tiles):
+    for nt in range(token_tiles):
+      acc = accs[ot][nt].after(update)
+      for e in range(4):
+        output = oblk*rows + ot*16 + g + 8*(e//2)
+        token = tblk*(8*token_tiles) + nt*8 + t*2 + (e%2)
+        stores.append(out[token, output, kchunk].store(acc[e].load()))
+  names = {Q4_K: "linear_q4_k_mma", Q5_K: "linear_q5_k_mma", Q6_K: "linear_q6_mma"}
+  return UOp.group(*stores).end(tblk, oblk, kchunk, lane).sink(arg=KernelInfo(name=names[ggml_type], opts_to_apply=()))
+
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   assert layer.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS)
   tokens = int(x.numel()) // layer.in_features
@@ -316,6 +404,15 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     fxn = _iq4_linear_f16_wmma_kernel if layer.ggml_type == IQ4_XS else functools.partial(_q5_linear_f16_wmma_kernel, ggml_type=layer.ggml_type)
     extra = (iq4_half_lut(str(x.device)).uop,) if layer.ggml_type == IQ4_XS else ()
     return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop, *extra)
+  if cuda and getenv("NV_MMA_LINEAR", 1) and tokens % 8 == 0 and tokens >= 16 and out_features % 16 == 0 and in_features % 256 == 0:
+    nt = max(b for b in (1, 2, 4) if tokens % (8*b) == 0 and b <= getenv("NV_MMA_TT", 4))
+    ot = max(b for b in (1, 2, 4) if out_features % (16*b) == 0 and b <= getenv("NV_MMA_OT", 1))
+    groups, warps = in_features // 32, (tokens // (8*nt)) * (out_features // (16*ot))
+    ksplit = max(b for b in (1, 2, 4, 8, 16) if groups % (8*b) == 0 and groups // (8*b) >= 2 and (b == 1 or warps*b <= getenv("NV_MMA_WARPS", 2048)))
+    ksplit = getenv("NV_MMA_KSPLIT", ksplit)
+    fxn = functools.partial(_quant_linear_cuda_mma_kernel, ggml_type=layer.ggml_type, token_tiles=nt, output_tiles=ot, ksplit=ksplit)
+    out = Tensor.empty(tokens, out_features, ksplit, dtype=dtypes.float32, device=x.device).uop
+    return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop)
   xq, xd = q8_quantize(x, tokens, in_features)
   # tokens x output rows per warp, tuned on an RTX 3060 Ti with 32-token prefill chunks (Q6_K's byte-wise unpacking wants more tokens)
   max_tb, max_ob = getenv("NV_Q8_TOKEN_BLOCK", 16 if layer.ggml_type == Q6_K else 8), getenv("NV_Q8_OUT_BLOCK", 4 if layer.ggml_type == Q6_K else 8)
