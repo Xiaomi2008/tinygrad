@@ -589,14 +589,25 @@ def _quad_reduce(val:UOp, maximum:bool) -> UOp:
     val = val.maximum(other) if maximum else val + other
   return val
 
-def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, *scales:UOp, valid_kv_len:UOp, q_start:UOp, tokens:int) -> UOp:
-  # scales: an int8 cache's fp16 scale per (k/v, head, position); K's scales the scores, V's is folded into P
+def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, *scales:UOp, valid_kv_len:UOp, q_start:UOp, tokens:int,
+                               kv_fmt:str="fp16") -> UOp:
+  # scales: a quantized cache's fp16 scale per (k/v, head, position); K's scales the scores, V's is folded into P.
+  # kv_fmt k8vr4: cache rows are [D bytes of int8 K | D/2 bytes of 4-bit V (nibble - 8, low nibble first)]
   # rows are (query head within the KV group, token): row r is token r % tokens, so a KV group's heads share each K/V load
   BH, Tp, S, D = o.shape
-  _, B, H_KV, max_ctx, _ = cache.shape
-  k, v = cache[0].reshape(B*H_KV, max_ctx, D), cache[1].reshape(B*H_KV, max_ctx, D)
+  if kv_fmt == "k8vr4":
+    B, H_KV, max_ctx, W = cache.shape
+    k = v = cache.reshape(B*H_KV, max_ctx, W)
+  else:
+    _, B, H_KV, max_ctx, _ = cache.shape
+    k, v = cache[0].reshape(B*H_KV, max_ctx, D), cache[1].reshape(B*H_KV, max_ctx, D)
   ks, vs = (scales[0][0].reshape(B*H_KV, max_ctx), scales[0][1].reshape(B*H_KV, max_ctx)) if scales else (None, None)
-  as_half = (lambda u: u.cast(dtypes.float16)) if scales else (lambda u: u)
+  def kval(src:UOp, h:UOp, key:UOp, d:UOp, is_v:bool=False) -> UOp:
+    if kv_fmt == "fp16": return src[h, key, d]
+    if kv_fmt == "int8": return src[h, key, d].cast(dtypes.float16)
+    if not is_v: return src[h, key, d].bitcast(dtypes.int8).cast(dtypes.float16)
+    nib = (src[h, key, D + d//2] >> ((d%2)*4).cast(dtypes.uint8)) & 15
+    return (nib.cast(dtypes.float32) - 8).cast(dtypes.float16)
   bh, qt, sp = UOp.range(BH, 0), UOp.range(Tp//16, 1), UOp.range(S, 2)
   lane = UOp.range(WARP_SIZE, 3, axis_type=AxisType.LOCAL)
   hw_lane = (UOp(Ops.CUSTOM, dtypes.int32, (lane.int(),), arg="((int)(threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z))+0*{0})")
@@ -622,7 +633,7 @@ def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, *scales:UOp, val
     a = UOp.stack(qrow(g, d0), qrow(g, d0+1), qrow(g+8, d0), qrow(g+8, d0+1), qrow(g, d0+8), qrow(g, d0+9), qrow(g+8, d0+8), qrow(g+8, d0+9))
     for nb in range(2):
       key = (kbase + nb*8 + g).minimum(max_ctx-1)
-      b = UOp.stack(*(as_half(k[kvh, key, d0+o_]) for o_ in (0, 1, 8, 9)))
+      b = UOp.stack(*(kval(k, kvh, key, d0+o_) for o_ in (0, 1, 8, 9)))
       s_acc[nb] = UOp.wmma(a, b, s_acc[nb], *CUDA_MMA_ARG)
   s_done = [r.after(r.store(v)) for r,v in zip(s_regs, s_acc)]
   # masked, scaled (log2 domain) scores; element e of tile nb: row g+8*(e//2), key kbase+nb*8+2t+e%2
@@ -654,7 +665,7 @@ def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, *scales:UOp, val
   for dn in range(D//8):
     cur = O[dn].after(kt)
     scaled = cur.after(UOp.group(*(cur[e].store(cur[e].load()*corr[e//2]) for e in range(4))))
-    vb = UOp.stack(*(as_half(v[kvh, (kbase + t*2 + o_).minimum(max_ctx-1), dn*8+g]) for o_ in (0, 1, 8, 9)))
+    vb = UOp.stack(*(kval(v, kvh, (kbase + t*2 + o_).minimum(max_ctx-1), dn*8+g, is_v=True) for o_ in (0, 1, 8, 9)))
     stores.append(O[dn].store(UOp.wmma(pa, vb, scaled, *CUDA_MMA_ARG)))
   last = kt.eq(n_iter - 1)
   regs_done = UOp.group(*stores)
@@ -668,11 +679,12 @@ def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, *scales:UOp, val
   outs = [UOp.group(*outs).end(kt)]
   return UOp.group(*outs).end(bh, qt, sp, lane).sink(arg=KernelInfo(name="flash_attention_nv", opts_to_apply=()))
 
-def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, kv_scale:Tensor|None=None) -> Tensor:
+def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, kv_scale:Tensor|None=None, kv_fmt:str|None=None) -> Tensor:
   # q (B,H,T,D), T symbolic (padded to its max) or static; returns (B,H,T,D) float. The heads of a KV group are packed into the rows.
   T_real, S = q.shape[2], getenv("NV_FA_SPLITS", 32)
   B, H, _, D = q.shape
-  H_KV = cast(int, assigned_kv.shape[2])
+  if kv_fmt is None: kv_fmt = "fp16" if kv_scale is None else "int8"
+  H_KV = cast(int, assigned_kv.shape[1 if kv_fmt == "k8vr4" else 2])
   gqa = H // H_KV
   T_pad = q.max_shape[2] if isinstance(T_real, UOp) else T_real
   while (gqa*T_pad) % 16: T_pad += 1
@@ -681,7 +693,8 @@ def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, kv_scale
   rows = gqa*T_pad
   o = Tensor.empty(B*H_KV, rows, S, D, dtype="float32", device=q.device)
   ml = Tensor.empty(B*H_KV, rows, S, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_nv_flash_attention_kernel, valid_kv_len=_unbind(valid_end), q_start=_unbind(valid_end - T_real), tokens=T_pad)
+  fxn = functools.partial(_nv_flash_attention_kernel, valid_kv_len=_unbind(valid_end), q_start=_unbind(valid_end - T_real), tokens=T_pad,
+                          kv_fmt=kv_fmt)
   o, ml = Tensor.custom_kernel(o, ml, q.half().reshape(B*H_KV, rows, D).contiguous(), assigned_kv,
                                *([kv_scale] if kv_scale is not None else []), fxn=fxn)[:2]
   mx, sm = ml[..., 0], ml[..., 1]

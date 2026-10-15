@@ -150,6 +150,25 @@ class FFNBlock:
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
+# ******** quantized KV cache ********
+
+def kv_rotation(D:int, device) -> Tensor:
+  # random-sign Hadamard matrix / sqrt(D): orthogonal (o = (P (v R)) R^T), and it spreads outlier channels over all of them
+  assert D & (D-1) == 0, "head_dim must be a power of two"
+  signs = [1 if (i*2654435761 >> 7) & 1 else -1 for i in range(D)]
+  # realized here: left lazy, the graph re-uploads it from the host on every call (8 copies per token over the eGPU link)
+  return Tensor([[signs[i] * (1 if bin(i & j).count("1") % 2 == 0 else -1) / D**0.5 for j in range(D)] for i in range(D)],
+                device=device).contiguous().realize()
+
+def kv_quantize(x:Tensor, bits:int) -> tuple[Tensor, Tensor]:
+  # symmetric absmax per vector: 8 bits -> int8 values; 4 bits -> nibble + 8 in 1..15, two per byte (low nibble first)
+  levels = 127 if bits == 8 else 7
+  scale = (x.abs().max(-1) / levels).maximum(1e-8)
+  q = (x / scale.unsqueeze(-1)).round().clip(-levels, levels)
+  if bits == 8: return q.cast(dtypes.int8), scale
+  n = (q + 8).cast(dtypes.uint8).reshape(*x.shape[:-1], x.shape[-1]//2, 2)
+  return n[..., 0] | (n[..., 1] << 4), scale
+
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
@@ -181,11 +200,15 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    kv_scale = None
-    if self._kv_int8(x):
-      kv_new = Tensor.stack(k, v).float()
-      scale = (kv_new.abs().max(-1) / 127).maximum(1e-8)
-      store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store((kv_new / scale.unsqueeze(-1)).round().clip(-127, 127).cast(dtypes.int8).uop)
+    kv_scale, fmt = None, self._kv_fmt(x)
+    if fmt == "int8":
+      values, scale = kv_quantize(Tensor.stack(k, v).float(), 8)
+      store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(values.uop)
+    elif fmt == "k8vr4":
+      (kq, kscale), (vq, vscale) = kv_quantize(k.float(), 8), kv_quantize(v.float() @ self.kv_rot, 4)
+      store = self.cache_kv[:, :, start_pos:start_pos+T, :].uop.store(kq.bitcast(dtypes.uint8).cat(vq, dim=-1).uop)
+      scale = Tensor.stack(kscale, vscale)
+    if fmt != "fp16":
       scale_store = self.cache_kv_scale[:, :, :, start_pos:start_pos+T].uop.store(scale.cast(dtypes.half).uop)
       kv_scale = Tensor(self.cache_kv_scale.uop.after(scale_store))
     else: store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
@@ -197,14 +220,22 @@ class TransformerBlock(FFNBlock):
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     # on NV, prefill chunks (and decode: a KV group's heads fill the rows) use the tensor-core flash attention kernel over the KV cache
     if _device_name(x.device) == "NV" and getenv("NV_FLASH_ATTN", 1) and (resolve(T != 1) or getenv("NV_FLASH_DECODE", 1)):
-      attn = flash_attention_nv(q, assigned_kv, start_pos+T, kv_scale).cast(x.dtype)
-      attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+      attn = flash_attention_nv(q, assigned_kv, start_pos+T, kv_scale, fmt)
+      if fmt == "k8vr4": attn = attn @ self.kv_rot.T                                   # V was stored rotated
+      attn = attn.cast(x.dtype).transpose(1, 2).reshape(B, T, -1)                      # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
-    if kv_scale is not None:
-      k = k.cast(dtypes.half) * kv_scale[0, :, :, 0:start_pos+T].unsqueeze(-1)
-      v = v.cast(dtypes.half) * kv_scale[1, :, :, 0:start_pos+T].unsqueeze(-1)
+    if fmt == "k8vr4":
+      D = self.config.head_dim
+      k = assigned_kv[:, :, 0:start_pos+T, :D].bitcast(dtypes.int8).cast(dtypes.half) * kv_scale[0, :, :, 0:start_pos+T].unsqueeze(-1)
+      n = assigned_kv[:, :, 0:start_pos+T, D:]
+      n = Tensor.stack(n & 15, n >> 4, dim=-1).reshape(*n.shape[:-1], D).float() - 8
+      v = (n * kv_scale[1, :, :, 0:start_pos+T].unsqueeze(-1).float()).cast(dtypes.half)
+    else:
+      k = assigned_kv[0, :, :, 0:start_pos+T, :]
+      v = assigned_kv[1, :, :, 0:start_pos+T, :]
+      if kv_scale is not None:
+        k = k.cast(dtypes.half) * kv_scale[0, :, :, 0:start_pos+T].unsqueeze(-1)
+        v = v.cast(dtypes.half) * kv_scale[1, :, :, 0:start_pos+T].unsqueeze(-1)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -218,19 +249,27 @@ class TransformerBlock(FFNBlock):
     mask = (Tensor.arange(T).unsqueeze(-1) + (start_pos+1) <= cols).where(float("-inf"), 0).cast(x.dtype).reshape(1, 1, T, start_pos+T) \
       if resolve(T != 1) else None
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    if fmt == "k8vr4": attn = attn.float() @ self.kv_rot.T
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
-  def _kv_int8(self, x:Tensor) -> bool: return _device_name(x.device) == "NV" and bool(getenv("KV_INT8", 1))
+  def _kv_fmt(self, x:Tensor) -> str:
+    # KV_FMT (NV): int8 (default: int8 K and V, fp16 scale per position) | k8vr4 (int8 K, V rotated by a random-sign Hadamard
+    # matrix and stored at 4 bits: 0.75 bytes per value) | fp16. K needs 8 bits (4-bit K moved the next-token distribution ~20x
+    # more than 4-bit V); the rotation spreads V's outlier channels, cutting its 4-bit error ~3x.
+    if _device_name(x.device) != "NV": return "fp16"
+    return str(getenv("KV_FMT", "int8" if getenv("KV_INT8", 1) else "fp16"))
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
       # KV_INT8 (NV): int8 values with an fp16 scale per (k/v, head, position), half the memory of an fp16 cache
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.int8 if self._kv_int8(x) else dtypes.half, device=x.device)
-      if self._kv_int8(x):
-        self.cache_kv_scale = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, dtype=dtypes.half, device=x.device)
+      fmt, B, H, C, D = self._kv_fmt(x), x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim
+      # k8vr4: one row per position, D bytes of int8 K then D/2 bytes of 4-bit V (two per byte, low nibble first)
+      if fmt == "k8vr4": self.cache_kv = Tensor.zeros(B, H, C, D + D//2, dtype=dtypes.uint8, device=x.device)
+      else: self.cache_kv = Tensor.zeros(2, B, H, C, D, dtype=dtypes.int8 if fmt == "int8" else dtypes.half, device=x.device)
+      if fmt != "fp16": self.cache_kv_scale = Tensor.zeros(2, B, H, C, dtype=dtypes.half, device=x.device)
+      if fmt == "k8vr4": self.kv_rot = kv_rotation(D, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
