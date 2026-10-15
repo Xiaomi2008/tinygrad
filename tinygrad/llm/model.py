@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, gated_delta_kernel_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, flash_attention_nv, _device_name, amd_custom_kernels_supported, gated_delta_kernel_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -186,6 +186,11 @@ class TransformerBlock(FFNBlock):
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
+      attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+      return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    # on NV, prefill chunks use the tensor-core flash attention kernel over the KV cache
+    if _device_name(x.device) == "NV" and getenv("NV_FLASH_ATTN", 1) and resolve(T != 1):
+      attn = flash_attention_nv(q, assigned_kv, start_pos+T).cast(x.dtype)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]

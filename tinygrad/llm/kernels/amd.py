@@ -576,6 +576,103 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
 
+# ******** NV prefill flash attention: mma.sync m16n8k16, split over the KV cache ********
+# warp = 16 queries of one head x one of S interleaved KV splits (16-key tiles); scores, online softmax and P@V stay in registers (the C fragment
+# of S is the A fragment of P). Splits write unnormalized O with (max, sum); flash_attention_nv combines them.
+
+def _quad_reduce(val:UOp, maximum:bool) -> UOp:
+  for offset in (1, 2):
+    other = UOp(Ops.CUSTOM, dtypes.float, (val,), arg=f"__shfl_xor_sync(0xffffffffu, {{0}}, {offset})")
+    val = val.maximum(other) if maximum else val + other
+  return val
+
+def _nv_flash_attention_kernel(o:UOp, ml:UOp, q:UOp, cache:UOp, valid_kv_len:UOp, q_start:UOp) -> UOp:
+  BH, Tp, S, D = o.shape
+  _, B, H_KV, max_ctx, _ = cache.shape
+  gqa = BH // (B*H_KV)
+  k, v = cache[0].reshape(B*H_KV, max_ctx, D), cache[1].reshape(B*H_KV, max_ctx, D)
+  bh, qt, sp = UOp.range(BH, 0), UOp.range(Tp//16, 1), UOp.range(S, 2)
+  lane = UOp.range(WARP_SIZE, 3, axis_type=AxisType.LOCAL)
+  hw_lane = (UOp(Ops.CUSTOM, dtypes.int32, (lane.int(),), arg="((int)(threadIdx.x+blockDim.x*(threadIdx.y+blockDim.y*threadIdx.z))+0*{0})")
+             & 31).cast(dtypes.weakint)
+  g, t = hw_lane//4, hw_lane%4
+  kvh = bh // gqa
+  q0 = qt*16
+  scale = LOG2E / math.sqrt(D)
+  m, l = _reg((2,), 0, -math.inf), _reg((2,), 1, 0)
+  O = [_reg((4,), 2+dn, 0) for dn in range(D//8)]
+  # interleaved splits: split sp takes key tiles sp, sp+S, sp+2S, ... (never-negative trip count, balanced work)
+  # every split runs the same ceil(tiles/S) iterations (tiles past valid_kv_len are masked and their loads clamped) and writes its
+  # result on the last one: nothing runs after the loop (the linearizer can define shared subexpressions inside it)
+  n_iter = ((valid_kv_len + 15)//16 + (S - 1)) // S
+  kt = UOp.range(n_iter, 10, AxisType.REDUCE)
+  kbase = (sp + kt*S)*16
+  # S = Q K^T for 16 keys (two n-tiles of 8)
+  s_regs = [UOp.placeholder((4,), dtypes.float, slot=100+nb, addrspace=AddrSpace.REG) for nb in range(2)]
+  s_acc = [r.after(r.after(kt).store(r.const_like(0))) for r in s_regs]
+  qrow = lambda r, dd: q[bh, q0 + r, dd]
+  for ds in range(D//16):
+    d0 = ds*16 + t*2
+    a = UOp.stack(qrow(g, d0), qrow(g, d0+1), qrow(g+8, d0), qrow(g+8, d0+1), qrow(g, d0+8), qrow(g, d0+9), qrow(g+8, d0+8), qrow(g+8, d0+9))
+    for nb in range(2):
+      key = (kbase + nb*8 + g).minimum(max_ctx-1)
+      b = UOp.stack(k[kvh, key, d0], k[kvh, key, d0+1], k[kvh, key, d0+8], k[kvh, key, d0+9])
+      s_acc[nb] = UOp.wmma(a, b, s_acc[nb], *CUDA_MMA_ARG)
+  s_done = [r.after(r.store(v)) for r,v in zip(s_regs, s_acc)]
+  # masked, scaled (log2 domain) scores; element e of tile nb: row g+8*(e//2), key kbase+nb*8+2t+e%2
+  sc = {}
+  for nb in range(2):
+    for e in range(4):
+      key, qpos = kbase + nb*8 + t*2 + e%2, q_start + q0 + g + 8*(e//2)
+      sc[(nb, e)] = ((key <= qpos) & (key < valid_kv_len)).where(s_done[nb][e].load()*scale, -math.inf)
+  m_old = [m.after(kt)[r].load() for r in range(2)]
+  l_old = [l.after(kt)[r].load() for r in range(2)]
+  m_new, corr, p, l_new = [], [], {}, []
+  for r in range(2):
+    es = (0, 1) if r == 0 else (2, 3)
+    rowmax = _quad_reduce(functools.reduce(lambda x, y: x.maximum(y), [sc[(nb, e)] for nb in range(2) for e in es]), True)
+    mn = m_old[r].maximum(rowmax)
+    safe = mn.eq(-math.inf).where(0.0, mn)
+    corr.append((m_old[r] - safe).exp2())
+    for nb in range(2):
+      for e in es: p[(nb, e)] = (sc[(nb, e)] - safe).exp2()
+    l_new.append(l_old[r]*corr[r] + _quad_reduce(sum(p[(nb, e)] for nb in range(2) for e in es), False))
+    m_new.append(mn)
+  pa = UOp.stack(*(p[(nb, e)].cast(dtypes.float16) for nb in range(2) for e in range(4)))
+  stores = [m[r].store(m_new[r]) for r in range(2)] + [l[r].store(l_new[r]) for r in range(2)]
+  for dn in range(D//8):
+    cur = O[dn].after(kt)
+    scaled = cur.after(UOp.group(*(cur[e].store(cur[e].load()*corr[e//2]) for e in range(4))))
+    vb = UOp.stack(*(v[kvh, (kbase + t*2 + o_).minimum(max_ctx-1), dn*8+g] for o_ in (0, 1, 8, 9)))
+    stores.append(O[dn].store(UOp.wmma(pa, vb, scaled, *CUDA_MMA_ARG)))
+  last = kt.eq(n_iter - 1)
+  regs_done = UOp.group(*stores)
+  outs = []
+  for dn in range(D//8):
+    acc = O[dn].after(regs_done)
+    for e in range(4): outs.append(o[bh, q0 + g + 8*(e//2), sp, (dn*8 + t*2 + e%2).valid(last)].store(acc[e].load()))
+  for r in range(2):
+    for i, src in enumerate((m, l)):
+      outs.append(ml[bh, q0 + g + 8*r, sp, UOp.const(i, dtypes.weakint).valid(t.eq(0) & last)].store(src.after(regs_done)[r].load()))
+  outs = [UOp.group(*outs).end(kt)]
+  return UOp.group(*outs).end(bh, qt, sp, lane).sink(arg=KernelInfo(name="flash_attention_nv", opts_to_apply=()))
+
+def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
+  # q (B,H,T,D) with T symbolic or static; returns (B,H,T,D) float
+  T_real, S = q.shape[2], getenv("NV_FA_SPLITS", 32)
+  T_pad = q.max_shape[2] if isinstance(T_real, UOp) else T_real
+  if isinstance(T_real, UOp): q = q.pad_to((*q.shape[:2], T_pad, q.shape[3]))
+  B, H, _, D = q.shape
+  o = Tensor.empty(B*H, T_pad, S, D, dtype="float32", device=q.device)
+  ml = Tensor.empty(B*H, T_pad, S, 2, dtype="float32", device=q.device)
+  fxn = functools.partial(_nv_flash_attention_kernel, valid_kv_len=_unbind(valid_end), q_start=_unbind(valid_end - T_real))
+  o, ml = Tensor.custom_kernel(o, ml, q.half().reshape(B*H, T_pad, D).contiguous(), assigned_kv, fxn=fxn)[:2]
+  mx, sm = ml[..., 0], ml[..., 1]
+  top = mx.max(-1, keepdim=True)
+  w = (mx - top).exp2()
+  out = ((o * w.unsqueeze(-1)).sum(2) / (sm * w).sum(-1, keepdim=True)).reshape(B, H, T_pad, D)
+  return out[:, :, :T_real] if isinstance(T_real, UOp) else out
+
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
