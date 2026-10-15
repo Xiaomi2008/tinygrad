@@ -128,6 +128,9 @@ class _System:
   @functools.cache
   def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
     if getenv("REMOTE", ""): return RemotePCIDevice.scan(vendor, devices, base_class)
+    if OSX:  # LOCAL TEST ONLY: TinyGPU route from extra/hcq1
+      from extra.hcq1.remote import APLRemotePCIDevice
+      return [(APLRemotePCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
     return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
 
   def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):

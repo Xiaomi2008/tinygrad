@@ -2,7 +2,7 @@ from __future__ import annotations
 import ctypes, time, array, struct, itertools, dataclasses
 from typing import cast, Any
 from tinygrad.runtime.autogen import nv, nv_570 as nv_gpu, pci
-from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv
+from tinygrad.helpers import lo32, hi32, DEBUG, round_up, round_down, fetch_fw, wait_cond, ceildiv, getenv
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.memory import MMIOInterface
 from tinygrad.runtime.support.elf import elf_loader
@@ -615,6 +615,7 @@ class NV_GSP(NV_IP):
 
   def rpc_set_registry_table(self):
     table = {'RMForcePcieConfigSave': 0x1, 'RMSecBusResetEnable': 0x1}
+    if getenv("NV_PCIE_GEN1", 0): table |= {'RMPcieLinkSpeed': 0x800002AA, 'PCIEPowerControl': 0x3}  # LOCAL TEST ONLY
     entries_bytes, data_bytes = bytes(), bytes()
     hdr_size, entries_size = ctypes.sizeof(nv.PACKED_REGISTRY_TABLE), ctypes.sizeof(nv.PACKED_REGISTRY_ENTRY) * len(table)
 
