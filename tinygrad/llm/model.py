@@ -383,6 +383,13 @@ class Transformer:
     # we specialize the JIT for prefill and rollout
     self.prefill_jit = TinyJit(self.forward)
     self.rollout_jit = TinyJit(self.forward)
+    # prompt chunks before the last one only fill the caches: no output projection (the 248k-row LM head is ~5% of a chunk)
+    self.prefill_body_jit = TinyJit(self.forward_body)
+
+  def forward_body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    x = self.token_embd(tokens).float()
+    for block in self.blk: x = block(x, start_pos)
+    return x[:, -1:, :1].contiguous()
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
@@ -481,6 +488,10 @@ class Transformer:
 
   def warmup(self):
     for _ in range(2): list(zip(range(2), self.generate([0])))
+    # a two-chunk prompt captures both prefill paths (cache-filling chunks without the head, and the last chunk), each runs once
+    # per prompt; different tokens each time so nothing is reused from the cache
+    for i in range(2): list(zip(range(2), self.generate([1+i]*(getenv("PREFILL_CHUNK", 32)+8))))
+    self._cached_tokens, self._checkpoint_tokens = [], []
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -531,7 +542,9 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      if start_pos + n_toks < len(tokens) and n_toks > 1 and getenv("PREFILL_SKIP_HEAD", 1):
+        self.prefill_body_jit(t[:, sp:sp+nt].contiguous(), sp).realize()
+      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
       # chunked prefill: keep processing until all prompt tokens are consumed
