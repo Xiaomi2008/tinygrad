@@ -304,8 +304,10 @@ class PCIIfaceBase:
                      meta=PCIAllocationMeta(mapping, True, hMemory=mapping.paddrs[0][0] + off, pool_off=off), owner=self.dev)
 
   def free(self, b:HCQBuffer):
-    # pool blocks are never reused: reusing them hung the GPU when JIT graphs were freed and new ones created (even after waiting for
-    # the GPU to pass the freeing point; root cause unknown). A full pool falls back to host memory, which is slower but correct.
+    # pool blocks are never reused: reusing them hung the GPU when JIT graphs were freed and new ones created. The freed blocks are
+    # command-queue pages (kernel args go through the LRU cache); the hang followed a new graph's commands landing where a larger
+    # command buffer had been. Ruled out: overlapping allocations, the GPU still running the old graph, stale L2 (a full
+    # flush+invalidate before reuse did not help). A full pool falls back to host memory, which is slower but correct.
     if b.owner == self.dev and getattr(b.meta, "pool_off", None) is not None: return
     if b.owner != self.dev: self.dev.iface.dev_impl.mm.unmap_range(b.va_addr, round_up(b.size, 0x1000))
     if b.owner == self.dev and b.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(b.meta.mapping)
