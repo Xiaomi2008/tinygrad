@@ -6,7 +6,7 @@ from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
-from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.renderer.cstyle import HIPRenderer, CUDARenderer
 
 BLOCK_M, BLOCK_N, WARP_SIZE = 32, 32, 32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 16
@@ -34,16 +34,34 @@ def amd_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   with Context(ALLOW_DEVICE_USAGE=1):
     return (t:=getattr(Device[device], "target", None)) is not None and t[0] in (11, 12) and isinstance(Device[device].renderer, HIPRenderer)
 
+def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
+  # the wave32 integer-dot decode and gated delta kernels also map onto CUDA warps (__shfl_xor_sync, __dp4a); not the WMMA ones
+  if getenv("DISABLE_NV_KERNELS"): return False
+  if isinstance(device, tuple): device = device[0]
+  if device is None or device.split(":")[0] != "NV": return False
+  with Context(ALLOW_DEVICE_USAGE=1): return isinstance(Device[device].renderer, CUDARenderer)
+
+def custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
+  return amd_custom_kernels_supported(device) or nv_custom_kernels_supported(device)
+
+# IQ4 unpacking uses AMD's byte_perm, whose selector encoding differs from CUDA's __byte_perm
+NV_UNSUPPORTED_QUANTS = (IQ4_NL, IQ4_XS)
+
 @functools.cache
 def _wmma_rdna4(device:str|tuple[str, ...]) -> bool:
   if isinstance(device, tuple): device = device[0]
   with Context(ALLOW_DEVICE_USAGE=1): return getattr(Device[device], "target")[0] == 12
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def _xor_shuffle(offset:int, dtype, cuda:bool) -> str:
+  # exchange with lane^offset: ds_swizzle in xor mode on AMD, __shfl_xor_sync on a 32-lane CUDA warp
+  if cuda: return f"__shfl_xor_sync(0xffffffffu, {{0}}, {offset})"
+  if dtype == dtypes.float: return f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))"
+  return f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | offset<<10})"
+
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, cuda:bool=False) -> UOp:
   for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp(Ops.CUSTOM, src=(val,), arg=
-      (f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))", dtypes.float))
+    other = UOp(Ops.CUSTOM, src=(val,), arg=(_xor_shuffle(offset, dtypes.float, cuda), dtypes.float))
     val = val.maximum(other) if maximum else val + other
   return val
 
@@ -89,19 +107,21 @@ class Linear(nn.Linear):
     self.shard_axis = decoded.uop.axis
     self.weight = Tensor(raw).flatten().bitcast(word_dtype).contiguous()
   def __call__(self, x:Tensor) -> Tensor:
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
+    supported = self.use_custom_quant and custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
       if self.ggml_type is None:
         # tiny dense fp16 matmul (e.g. the ssm beta/alpha head rows): single fp16 gemv kernel instead of a
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
-        if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
+        if amd_custom_kernels_supported(self.weight.device) and self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) \
+          and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
           numel, max_shape = x.numel(), x.max_shape
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
             out = f16_gemv(self, x if isinstance(numel, int) else x.pad_to(max_shape))
             return out if isinstance(numel, int) else out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
         self.use_custom_quant = supported = False  # not a supported quant format
+    if nv_custom_kernels_supported(self.weight.device) and self.ggml_type in NV_UNSUPPORTED_QUANTS: supported = False
     if self.ggml_type in QUANT_SIZES and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
@@ -109,8 +129,9 @@ class Linear(nn.Linear):
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
     return super().__call__(x)
 
-def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
-  return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
+def _amd_dp4a(a:UOp, b:UOp, c:UOp, cuda:bool=False) -> UOp:
+  return UOp(Ops.CUSTOMI, src=(a, b, c), arg=("__dp4a((int){}, (int){}, {})" if cuda else
+                                              "__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))
 
 def _amd_byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=tuple(x.cast(dtypes.uint32) for x in (a, b, selectors)), arg=("__builtin_amdgcn_perm({}, {}, {})", dtypes.uint32))
@@ -162,22 +183,22 @@ def iq4_half_lut(device:str|tuple[str, ...]|None) -> Tensor:
                       dtypes.float16).to(device, force=True).bitcast(dtypes.uint32)
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, xsum:UOp, x:UOp, tokens:int, in_features:int, cuda:bool=False) -> UOp:
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
   token, group = token_group//groups, token_group%groups
   value = x.reshape(tokens, groups, 32)[token, group, lane].load().float()
   # Quantize each input once, then pack four neighboring lanes into one word.
   # Keep divisions intact: reciprocal multiplication can move half-precision inputs across rounding ties.
-  d = UOp(Ops.CUSTOM, src=(warp_reduce(value.abs(), maximum=True, full_wave=True),), arg=("({0}/127.0f)", dtypes.float)).maximum(1e-8)
-  rounded = UOp(Ops.CUSTOM, src=(value, d), arg=("__builtin_nearbyintf({0}/{1})", dtypes.float))
+  d = UOp(Ops.CUSTOM, src=(warp_reduce(value.abs(), maximum=True, full_wave=True, cuda=cuda),), arg=("({0}/127.0f)", dtypes.float)).maximum(1e-8)
+  rounded = UOp(Ops.CUSTOM, src=(value, d), arg=("nearbyintf({0}/{1})" if cuda else "__builtin_nearbyintf({0}/{1})", dtypes.float))
   quant = rounded.clip(-127, 127).cast(dtypes.int8)
   word = quant.cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
   for offset in (1, 2):
-    word |= UOp(Ops.CUSTOM, src=(word,), arg=(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | offset<<10})", dtypes.uint32))
+    word |= UOp(Ops.CUSTOM, src=(word,), arg=(_xor_shuffle(offset, dtypes.uint32, cuda), dtypes.uint32))
   stores = (q[token, group, (lane//4).valid((lane%4).eq(0))].store(word),
             scale[token, group.valid(lane.eq(0))].store(d),
-            xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float())))
+            xsum[token, group, (lane//16).valid((lane%16).eq(0))].store(warp_reduce(quant.float(), cuda=cuda)))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize", opts_to_apply=()))
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
@@ -185,23 +206,27 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor, 
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   xsum = Tensor.empty(tokens, groups, 2, dtype=dtypes.float32, device=x.device)
-  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  q, scale, xsum = Tensor.custom_kernel(q, scale, xsum, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features,
+                                                                                cuda=nv_custom_kernels_supported(x.device)))[:3]
   return q, scale, xsum
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
+def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str, cuda:bool=False, token_block:int=1) -> UOp:
   chunks = out.shape[2]
   # One wave per output/chunk; group neighboring rows to amortize workgroup scheduling.
+  # token_block > 1: a wave computes several tokens, sharing the weight loads (the same UOps) between them
   rows = math.gcd(out_features, 4)
-  row = UOp.range(out.shape[0]*out_features//rows, 0, AxisType.GLOBAL)
+  row = UOp.range(out.shape[0]//token_block*out_features//rows, 0, AxisType.GLOBAL)
   wave = UOp.range(rows, 3, AxisType.LOCAL)
   token_output = row*rows+wave
   chunk, lane = UOp.range(chunks, 1, AxisType.GLOBAL), UOp.range(32, 2, AxisType.LOCAL)
-  token, output = token_output // out_features, token_output % out_features
+  tblock, output = token_output // out_features, token_output % out_features
   group = lane+chunk*32
-  value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(row, wave, chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  stores = []
+  for j in range(token_block):
+    token = tblock*token_block+j
+    value = (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
+    stores.append(out[token, output, chunk.valid(lane.eq(0))].store(warp_reduce(value, full_wave=True, cuda=cuda).cast(out.dtype)))
+  return UOp.group(*stores).end(row, wave, chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 def _iq_grid(device:str|tuple[str, ...]|None, ggml_type:int) -> Tensor:
   from tinygrad.runtime.autogen import ggml_common as ggml
@@ -260,7 +285,7 @@ def _quant_word(raw:UOp, base:UOp, subgroup:UOp, i:int|UOp, ggml_type:int, grid:
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
-                         out_features:int, in_features:int, ggml_type:int) -> UOp:
+                         out_features:int, in_features:int, ggml_type:int, cuda:bool=False, token_block:int=1) -> UOp:
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group//8, group%8
     base = (output*in_features//256 + block) * (QUANT_SIZES[ggml_type]//raw.dtype.itemsize)
@@ -273,7 +298,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *grids:UOp,
     for i in range(8):
       weights = _quant_word(raw, base, subgroup, i, ggml_type, grids[0] if grids else None)
       acc = i//(8//len(dots))
-      dots[acc] = _amd_dp4a(weights, xwords[i], dots[acc])
+      dots[acc] = _amd_dp4a(weights, xwords[i], dots[acc], cuda)
     if ggml_type in (Q4_K, Q5_K):
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
       total = dots[0].float()*d*scale - (xs[token, group, 0].load()+xs[token, group, 1].load())*dmin*minimum
@@ -447,7 +472,8 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   extra = (_iq_grid(x.device, layer.ggml_type),) if layer.ggml_type in (IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) else ()
   # the kernels write the output features of their own device
   local_out = out_features // len(dev) if isinstance(dev:=layer.weight.device, tuple) and layer.shard_axis == 0 else out_features
-  if tokens % 16 == 0 and local_out % 16 == 0:
+  cuda = nv_custom_kernels_supported(x.device)
+  if not cuda and tokens % 16 == 0 and local_out % 16 == 0:
     if layer.ggml_type == IQ4_XS:
       fxn, extra = _iq4_linear_f16_wmma_kernel, (iq4_half_lut(x.device),)
     else:
@@ -456,7 +482,9 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     fxn = functools.partial(fxn, rdna4=_wmma_rdna4(x.device))
     srcs = (x.cast(dtypes.float16).contiguous(), *extra)
   else:
-    fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
+    # on NV a prefill chunk also goes through the integer-dot kernel, a block of tokens per wave
+    token_block = max(b for b in (1, 2, 4, 8, 16) if tokens % b == 0) if cuda else 1
+    fxn = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cuda=cuda, token_block=token_block)
     srcs = (*q8_quantize(x, tokens, in_features), *extra)
     out_shape += ((in_features+1023)//1024,)
   out = Tensor.empty(out_shape, dtype=dtypes.float32, device=x.device, axis=None if layer.shard_axis is None else 1-layer.shard_axis)
@@ -756,7 +784,8 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp) -> Tensor:
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
+                                cuda:bool=False) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -779,8 +808,8 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   for row_idx,row in enumerate(rows):
     previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
     decayed, bv = tuple(x * alpha[bh, token, col if alpha_dim > 1 else 0].load() for x,col in zip(previous, cols)), beta[bh, token].load()
-    state_k = warp_reduce(sum((x*y for x,y in zip(decayed, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
-    state_q = warp_reduce(sum((x*y for x,y in zip(decayed, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
+    state_k = warp_reduce(sum((x*y for x,y in zip(decayed, keys)), UOp.const(0, dtypes.float32)), full_wave=True, cuda=cuda)
+    state_q = warp_reduce(sum((x*y for x,y in zip(decayed, queries)), UOp.const(0, dtypes.float32)), full_wave=True, cuda=cuda)
     delta = (v[bh, token, row].load() - state_k) * bv
     updates += [x + delta*y for x,y in zip(decayed, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q + delta*kq[bh, token]))
@@ -804,5 +833,6 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
-  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound()).call(*contig)
+  call = _gated_delta_prefill_kernel(*params, None if start_pos is None else start_pos.uop.unbound(),
+                                     cuda=nv_custom_kernels_supported(q.device)).call(*contig)
   return Tensor(contig[0].after(call))
