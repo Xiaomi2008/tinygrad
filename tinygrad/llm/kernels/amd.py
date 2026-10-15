@@ -310,8 +310,9 @@ def _quant_linear_cuda_mma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_
   # one warp: (16*output_tiles) outputs x (8*token_tiles) tokens. Each step stages one 256-weight block of its rows in shared memory
   # with coalesced loads, then runs the block's 16 k-steps from there. ksplit > 1 splits the blocks across warps; out[..., kchunk]
   # is summed afterwards.
+  # x arrives in fragment order: [token tile of 8, k-step of 16, lane, 4 halves], so each lane's B fragment is one 8-byte load
   tokens, rows = out.shape[0], 16*output_tiles
-  x = x.reshape(tokens, in_features)
+  x = x.reshape(tokens//8, in_features//16, WARP_SIZE, 4)
   tblk, oblk, kchunk = UOp.range(tokens//(8*token_tiles), 0), UOp.range(out_features//rows, 1), UOp.range(ksplit, 4)
   lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
   # the hardware lane: mma fragments are defined by it, and the local range may be split across threadIdx.x/y/z in any order
@@ -367,8 +368,8 @@ def _quant_linear_cuda_mma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_
   for sg in range(8):
     for h in range(2):
       k0 = h*16 + t*2  # within the subgroup
-      kk = block*GGML_BLOCK_SIZE + sg*32 + k0
-      bfrags = [UOp.stack(*(x[tblk*(8*token_tiles) + nt*8 + g, kk+o] for o in (0, 1, 8, 9))) for nt in range(token_tiles)]
+      ks = block*(GGML_BLOCK_SIZE//16) + sg*2 + h
+      bfrags = [UOp.stack(*(x[tblk*token_tiles + nt, ks, hw_lane, i] for i in range(4))) for nt in range(token_tiles)]
       for ot in range(output_tiles):
         p0, p1 = row_dequant(ot*16 + g, sg), row_dequant(ot*16 + g + 8, sg)
         afrag = UOp.stack(*p0(k0), *p1(k0), *p0(k0+8), *p1(k0+8))
@@ -412,7 +413,9 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     ksplit = getenv("NV_MMA_KSPLIT", ksplit)
     fxn = functools.partial(_quant_linear_cuda_mma_kernel, ggml_type=layer.ggml_type, token_tiles=nt, output_tiles=ot, ksplit=ksplit)
     out = Tensor.empty(tokens, out_features, ksplit, dtype=dtypes.float32, device=x.device).uop
-    return run(fxn, out, raw, x.cast(dtypes.float16).contiguous().uop)
+    # fragment order: lane (g, t) of token tile tb, k-step ks holds x[tb*8+g, ks*16 + (2t, 2t+1, 2t+8, 2t+9)]
+    xf = x.reshape(tokens, in_features).cast(dtypes.float16).reshape(tokens//8, 8, in_features//16, 2, 4, 2).permute(0, 2, 1, 4, 3, 5)
+    return run(fxn, out, raw, xf.contiguous().uop)
   xq, xd = q8_quantize(x, tokens, in_features)
   # tokens x output rows per warp, tuned on an RTX 3060 Ti with 32-token prefill chunks (Q6_K's byte-wise unpacking wants more tokens)
   max_tb, max_ob = getenv("NV_Q8_TOKEN_BLOCK", 16 if layer.ggml_type == Q6_K else 8), getenv("NV_Q8_OUT_BLOCK", 4 if layer.ggml_type == Q6_K else 8)
