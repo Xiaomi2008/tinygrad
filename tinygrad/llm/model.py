@@ -181,7 +181,14 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
+    kv_scale = None
+    if self._kv_int8(x):
+      kv_new = Tensor.stack(k, v).float()
+      scale = (kv_new.abs().max(-1) / 127).maximum(1e-8)
+      store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store((kv_new / scale.unsqueeze(-1)).round().clip(-127, 127).cast(dtypes.int8).uop)
+      scale_store = self.cache_kv_scale[:, :, :, start_pos:start_pos+T].uop.store(scale.cast(dtypes.half).uop)
+      kv_scale = Tensor(self.cache_kv_scale.uop.after(scale_store))
+    else: store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(dtypes.half).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
@@ -190,11 +197,14 @@ class TransformerBlock(FFNBlock):
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     # on NV, prefill chunks (and decode: a KV group's heads fill the rows) use the tensor-core flash attention kernel over the KV cache
     if _device_name(x.device) == "NV" and getenv("NV_FLASH_ATTN", 1) and (resolve(T != 1) or getenv("NV_FLASH_DECODE", 1)):
-      attn = flash_attention_nv(q, assigned_kv, start_pos+T).cast(x.dtype)
+      attn = flash_attention_nv(q, assigned_kv, start_pos+T, kv_scale).cast(x.dtype)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
+    if kv_scale is not None:
+      k = k.cast(dtypes.half) * kv_scale[0, :, :, 0:start_pos+T].unsqueeze(-1)
+      v = v.cast(dtypes.half) * kv_scale[1, :, :, 0:start_pos+T].unsqueeze(-1)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -211,11 +221,16 @@ class TransformerBlock(FFNBlock):
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
+  def _kv_int8(self, x:Tensor) -> bool: return _device_name(x.device) == "NV" and bool(getenv("KV_INT8", 1))
+
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
+      # KV_INT8 (NV): int8 values with an fp16 scale per (k/v, head, position), half the memory of an fp16 cache
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.half, device=x.device)
+                                   dtype=dtypes.int8 if self._kv_int8(x) else dtypes.half, device=x.device)
+      if self._kv_int8(x):
+        self.cache_kv_scale = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, dtype=dtypes.half, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class MLATransformerBlock(FFNBlock):
