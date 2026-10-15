@@ -505,7 +505,8 @@ class Transformer:
     for b, (conv, rec) in zip(self._recurrent_blocks(), self._checkpoint_state):
       Tensor.realize(b.conv_state.assign(conv), b.recurrent_state.assign(rec))
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, checkpoint:int|None=None):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, checkpoint:int|None=None):
+    if chunk_size is None: chunk_size = getenv("PREFILL_CHUNK", 32)
     if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)

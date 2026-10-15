@@ -320,7 +320,7 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   # tokens x output rows per warp, tuned on an RTX 3060 Ti with 32-token prefill chunks (Q6_K's byte-wise unpacking wants more tokens)
   max_tb, max_ob = getenv("NV_Q8_TOKEN_BLOCK", 16 if layer.ggml_type == Q6_K else 8), getenv("NV_Q8_OUT_BLOCK", 4 if layer.ggml_type == Q6_K else 8)
   token_block = max(b for b in (1, 2, 4, 8, 16, 32) if tokens % b == 0 and b <= max_tb) if cuda else 1
-  output_block = max(b for b in (1, 2, 4, 8) if out_features % b == 0 and b <= max_ob) if cuda and tokens > 1 else 1
+  output_block = max(b for b in (1, 2, 4, 8) if out_features % b == 0 and b <= max_ob) if cuda else 1
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, cuda=cuda, token_block=token_block, output_block=output_block)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   return run(decode, out, raw, xq.uop, xd.uop)
