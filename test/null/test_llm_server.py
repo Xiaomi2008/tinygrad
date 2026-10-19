@@ -269,6 +269,20 @@ class TestLLMToolCalls(unittest.TestCase):
     self.assertEqual(json.loads(calls[0].function.arguments), {"path":"README.md"})
     self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
 
+  def test_keepalive_while_tool_call_is_held_back(self):
+    # the tool call is only sent once complete: meanwhile the server sends SSE comments, which the client ignores
+    import requests
+    self.set_output('<tool_call>{"name":"read","arguments":{"path":"README.md"}}</tool_call>')
+    with patch("tinygrad.llm.serve.KEEPALIVE_S", 0.0):
+      raw = requests.post(f"http://127.0.0.1:{self.port}/v1/chat/completions", json={"model":"tool-model", "stream":True,
+                          "messages":[{"role":"user", "content":"Read README.md"}], "tools":self.tools()}).text
+      self.assertIn(": keepalive\n\n", raw)
+      chunks = list(self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read README.md"}],
+                                                       tools=self.tools(), stream=True))
+    calls = [tc for c in chunks if c.choices for tc in c.choices[0].delta.tool_calls or []]
+    self.assertEqual([(c.function.name, json.loads(c.function.arguments)) for c in calls], [("read", {"path":"README.md"})])
+    self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
+
   def test_multiple_xml_tool_calls(self):
     self.set_output("<tool_call><function=read><parameter=path>\"a\"</parameter></function></tool_call>"
                     "<tool_call><function=read><parameter=path>\"b\"</parameter></function></tool_call>")

@@ -83,8 +83,22 @@ class LiveStatus:
     tmp.write_text(json.dumps(self.state))
     os.replace(tmp, self.path)
 
+KEEPALIVE_S = 5.0
+
 class Handler(HTTPRequestHandler):
   server: LLMServer
+  def stream_json(self, source:typing.Generator):
+    # like HTTPRequestHandler.stream_json, plus None from the source -> an SSE comment line, which clients ignore
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      for r in source:
+        self.wfile.write(b": keepalive\n\n" if r is None else f"data: {json.dumps(r)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+      self.wfile.write(b"data: [DONE]\n\n")
+    except (BrokenPipeError, ConnectionResetError): source.close()
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
@@ -116,7 +130,7 @@ class Handler(HTTPRequestHandler):
               "gen":len(out), "gen_tps":gen_tps, "total_s":et-st, "interrupted":interrupted}
       status.update(force=True, phase="idle", completed=status.state["completed"]+1, last=last,
                     history=(status.state.get("history") or [])[-29:] + [last])
-    completed = False
+    completed, last_sent = False, time.perf_counter()
     try:
       yield chunk({"role":"assistant", "content":""})
       for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint, on_prefill=lambda pos: status.update(done=pos)):
@@ -127,7 +141,16 @@ class Handler(HTTPRequestHandler):
         if tok.is_end(next_id): break
         out.append(next_id)
         status.update(gen=len(out))
-        for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
+        sent = False
+        for field, delta in router.route(dec(next_id)):
+          yield chunk({field:delta})
+          sent = True
+        # a tool call is held back until it's complete, which for a whole file can take minutes: keep the connection alive (clients
+        # drop a silent one), and find out early when the client has gone so generation stops
+        if sent: last_sent = time.perf_counter()
+        elif time.perf_counter() - last_sent >= KEEPALIVE_S:
+          yield None
+          last_sent = time.perf_counter()
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
@@ -190,7 +213,7 @@ class Handler(HTTPRequestHandler):
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
         for c in chunks:
-          if not c["choices"]: continue
+          if c is None or not c["choices"]: continue
           choice = c["choices"][0]
           if (delta := choice.get("delta", {})):
             if delta.get("content"): out.append(delta["content"])
