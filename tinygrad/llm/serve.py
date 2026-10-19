@@ -131,14 +131,16 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
-      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
+      # extra template variables, e.g. {"enable_thinking": false} or Qwen3.8's {"reasoning_effort": "low"}
+      template_kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
+      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, **template_kwargs)
       ids: list[int] = self.server.tok.encode(rendered)
       # checkpoint recurrent state at the end of the last user message: once the next user message arrives, chat templates re-render the
       # turns after it differently (qwen3.5 drops their thinking blocks), so that is the last point the next request is sure to share
       checkpoint = None
       if (last_user:=max((i for i,m in enumerate(body["messages"]) if m.get("role") == "user"), default=None)) is not None:
         prefix = self.server.tok.encode(self.server.template.render(messages=body["messages"][:last_user+1], tools=body.get("tools"),
-                                                                    add_generation_prompt=False, preserve_thinking=True))
+                                                                    add_generation_prompt=False, **template_kwargs))
         if ids[:len(prefix)] == prefix: checkpoint = len(prefix)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:

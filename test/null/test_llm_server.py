@@ -111,6 +111,15 @@ class TestLLMServer(unittest.TestCase):
       self.mock_tok.encode.assert_any_call('<|im_start|>user\nHello world<|im_end|>\n'
                                               '<|im_start|>assistant\n<|im_end|>\n<|im_start|>tool\nresult<|im_end|>\n')
 
+  def test_chat_template_kwargs(self):
+    import jinja2
+    template = jinja2.Template("{% for m in messages %}{{ m.content }}{% endfor %}|{{ enable_thinking }}|{{ reasoning_effort|default('xhigh') }}")
+    with patch.object(self.server, "template", template), patch.object(self.mock_tok, "encode", side_effect=lambda text: [200, 201, 202]):
+      response = self.client.chat.completions.create(model="test", messages=[{"role":"user", "content":"Hi"}], stream=True,
+                                                     extra_body={"chat_template_kwargs":{"enable_thinking":False, "reasoning_effort":"low"}})
+      self.assertEqual(list(response)[-1].choices[0].finish_reason, "stop")
+      self.mock_tok.encode.assert_any_call("Hi|False|low")
+
   def test_content_is_streamed(self):
     stream = self.client.chat.completions.create(
       model="test",
