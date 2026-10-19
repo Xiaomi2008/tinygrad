@@ -1,9 +1,11 @@
 from __future__ import annotations
-import enum, functools, itertools, pathlib
+import enum, functools, itertools, mmap, pathlib
 from dataclasses import dataclass, replace
+from typing import cast
+from tinygrad.helpers import prod
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, flash_attention_nv, _device_name, amd_custom_kernels_supported, gated_delta_kernel_supported
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, gguf_load_partial, ggml_data_to_tensor, ggml_nbytes
 from tinygrad.uop.ops import resolve
 
 class ExpertGating(enum.IntEnum):
@@ -416,6 +418,29 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
+class HostEmbedding:
+  """
+  A quantized token embedding left in the GGUF file: each call copies only the packed rows of the tokens in use to the device,
+  where they're dequantized like any other weight. Saves the whole table in device memory (0.7 GB for a 248k vocab at 4 bits).
+  """
+  def __init__(self, path:str|pathlib.Path, offset:int, dims:tuple[int, ...], ggml_type:int):
+    (self.dim, self.vocab_size), self.ggml_type = dims, ggml_type
+    self.row_bytes = ggml_nbytes(self.dim, ggml_type)
+    with open(path, "rb") as f: self.mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    self.offset = offset
+
+  def rows(self, ids:list[int], pad_to:int, device:str) -> Tensor:
+    rb, base = self.row_bytes, self.offset
+    data = b"".join(self.mm[base+i*rb:base+(i+1)*rb] for i in ids) + bytes(rb * (pad_to - len(ids)))
+    return Tensor(data, device=device).reshape(1, pad_to, rb)
+
+  def __call__(self, raw:Tensor) -> Tensor:
+    # symbolic token count: dequantize the whole padded chunk, the garbage rows are sliced off
+    T = raw.shape[1]
+    if not isinstance(T, int): raw = raw.pad_to(raw.max_shape)
+    x = ggml_data_to_tensor(raw.flatten(), prod(raw.shape[:2]) * self.dim, self.ggml_type).reshape(*raw.shape[:2], self.dim)
+    return x if isinstance(T, int) else x[:, :T]
+
 class Transformer:
   def __init__(self, config:TransformerConfig):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -424,7 +449,8 @@ class Transformer:
     self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
                                if config.ssm and config.ssm_layers[i] else
                                block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
-    self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
+    self.token_embd: nn.Embedding|None = nn.Embedding(config.vocab_size, config.dim)
+    self.host_embd: HostEmbedding|None = None
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
@@ -440,13 +466,17 @@ class Transformer:
     # prompt chunks before the last one only fill the caches: no output projection (the 248k-row LM head is ~5% of a chunk)
     self.prefill_body_jit = TinyJit(self.forward_body)
 
+  # with a host embedding, `tokens` is the packed embedding rows (B, T, row_bytes) instead of the token ids (B, T)
+  def embed(self, tokens:Tensor) -> Tensor:
+    return (self.host_embd(tokens) if self.host_embd is not None else cast(nn.Embedding, self.token_embd)(tokens)).float()
+
   def forward_body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    x = self.token_embd(tokens).float()
+    x = self.embed(tokens)
     for block in self.blk: x = block(x, start_pos)
     return x[:, -1:, :1].contiguous()
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
+    x = self.embed(tokens)                                # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
@@ -459,8 +489,24 @@ class Transformer:
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    # HOST_EMBD: leave the token embedding in the file (see HostEmbedding) and skip the multi-token-prediction layers, which
+    # nothing here runs: 0.9 GB of device memory on Qwen3.8-27B
+    host_embd = None
+    if getenv("HOST_EMBD", 0) and not isinstance(gguf, Tensor):
+      def skip(kv:dict, name:str) -> bool:
+        arch = kv['general.architecture']
+        first_mtp = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
+        return name == 'token_embd.weight' or (name.startswith('blk.') and int(name.split('.')[1]) >= first_mtp)
+      kv, state_dict, skipped = gguf_load_partial(gguf, skip)
+      embd_offset, embd_dims, embd_type = skipped['token_embd.weight']
+      if 'output.weight' in state_dict: host_embd = HostEmbedding(gguf, embd_offset, embd_dims, embd_type)
+      else:  # tied output projection: the table is needed on the device anyway
+        n = ggml_nbytes(prod(embd_dims), embd_type)
+        raw = Tensor(pathlib.Path(gguf))[embd_offset:embd_offset+n+1].to(None).realize()
+        state_dict['token_embd.weight'] = ggml_data_to_tensor(raw, prod(embd_dims), embd_type).reshape(*reversed(embd_dims))
+    else:
+      # TODO: remove the need for copy to default device
+      kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -533,6 +579,7 @@ class Transformer:
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
+    if host_embd is not None: model.token_embd, model.host_embd = None, host_embd
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
@@ -577,14 +624,19 @@ class Transformer:
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, checkpoint:int|None=None):
     if chunk_size is None: chunk_size = getenv("PREFILL_CHUNK", 32)
-    if self.has_recurrent_block and not gated_delta_kernel_supported(self.token_embd.weight.device):
+    if self.has_recurrent_block and not gated_delta_kernel_supported(self.output_norm.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     temp = Tensor([temperature])
     # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    host, device = self.host_embd, self.output_norm.weight.device
+    if host is None: t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    # the model's input for tokens[start_pos:start_pos+n_toks]: token ids, or their packed embedding rows padded to the chunk size
+    def inputs(start_pos:int, n_toks:int, sp:UOp, nt:UOp) -> Tensor:
+      if host is None: return t[:, sp:sp+nt]
+      return host.rows(tokens[start_pos:start_pos+n_toks], chunk_size, device)[:, :nt]
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     if self.has_recurrent_block:
@@ -597,8 +649,10 @@ class Transformer:
       n_toks = min(chunk_size, len(tokens) - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       if start_pos + n_toks < len(tokens) and n_toks > 1 and getenv("PREFILL_SKIP_HEAD", 1):
-        self.prefill_body_jit(t[:, sp:sp+nt].contiguous(), sp).realize()
-      else: out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+        self.prefill_body_jit(inputs(start_pos, n_toks, sp, nt).contiguous(), sp).realize()
+      elif start_pos < prompt_len or out is None: out = self(inputs(start_pos, n_toks, sp, nt), sp, temp).realize()
+      # decode: feed the sampled token back (on the device, or as its embedding row read from the file)
+      else: out = self(out if host is None else host.rows(tokens[start_pos:start_pos+1], 1, device), sp, temp).realize()
       start_pos += n_toks
       if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
       # chunked prefill: keep processing until all prompt tokens are consumed
