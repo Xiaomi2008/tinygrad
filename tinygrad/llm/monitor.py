@@ -45,12 +45,14 @@ def render(st:dict|None, path:pathlib.Path) -> list[str]:
     last = st.get("last")
     lines += [f"{DIM}● idle{X}" + (f"{DIM}, last request finished {ago(last['end'])}{X}" if last else ""), ""]
   hist = st.get("history") or []
+  # speculative decoding: share of MTP drafts accepted
+  def acc(h:dict) -> str: return f"{h['accepted']/h['drafts']:.0%}" if h.get("drafts") else "-"
   lines += ["", f"{B}recent requests{X}",
-            f"{DIM}{'time':>8}  {'prompt':>7}  {'cached':>7}  {'new':>7}  {'PP tok/s':>8}  {'out':>6}  {'TG tok/s':>8}  {'total':>7}{X}"]
+            f"{DIM}{'time':>8}  {'prompt':>7}  {'cached':>7}  {'new':>7}  {'PP tok/s':>8}  {'out':>6}  {'TG tok/s':>8}  {'draft':>5}  {'total':>7}{X}"]
   for h in hist[-max(3, shutil.get_terminal_size((100, 30)).lines - 14):]:
     flag = f" {R}interrupted{X}" if h.get("interrupted") else ""
     lines.append(f"{time.strftime('%H:%M:%S', time.localtime(h['end'])):>8}  {h['prompt']:7,}  {h['cached']:7,}  {h['prompt'] - h['cached']:7,}  "
-                 f"{h['prefill_tps']:8.0f}  {h['gen']:6,}  {h['gen_tps']:8.1f}  {h['total_s']:6.1f}s{flag}")
+                 f"{h['prefill_tps']:8.0f}  {h['gen']:6,}  {h['gen_tps']:8.1f}  {acc(h):>5}  {h['total_s']:6.1f}s{flag}")
   # averages over requests big enough to measure: short prompts and replies are dominated by fixed overhead
   pp = [h["prefill_tps"] for h in hist if h["prompt"] - h["cached"] >= 512]
   tg = [h["gen_tps"] for h in hist if h["gen"] >= 32]

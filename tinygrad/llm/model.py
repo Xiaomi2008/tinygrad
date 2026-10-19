@@ -372,6 +372,10 @@ class GatedDeltaNetBlock(FFNBlock):
     conv_window = Tensor(win)
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
+    # speculative verify: keep the whole window and the recurrent state after each token, so rollback() can undo rejected tokens
+    hist = self.keep_history and isinstance(T, int) and T > 1
+    if hist:
+      conv_state_store = self.conv_state.uop.after(conv_state_store, self.conv_hist.uop.store(conv_window.cast(self.conv_hist.dtype).uop))
 
     conv_out = functools.reduce(lambda a,b: a+b,
       (conv_window[:, i:i+T_pad] * self.ssm_conv1d["weight"][:, i] for i in range(self.ssm_conv_kernel))).silu()
@@ -392,20 +396,22 @@ class GatedDeltaNetBlock(FFNBlock):
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
     if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and gated_delta_kernel_supported(x.device):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos), self.rec_hist if hist else None).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-1)
       state = initial.where(0, state.float())
-      outs = []
+      outs, states = [], []
       for t in range(T_pad):
         s1 = state * alpha[:, :, t]  # decay the state
         delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
         state = s1 + delta * k[:, :, t]
         outs.append((state * q[:, :, t]).sum(-1))
+        states.append(state)
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
+      if hist: state_store = state_store.after(self.rec_hist.uop.store(Tensor.stack(*states[:-1], dim=2).uop))
       core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
@@ -413,10 +419,20 @@ class GatedDeltaNetBlock(FFNBlock):
     if symbolic: z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
 
+  keep_history = False
+
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+    if self.keep_history and isinstance(T:=x.shape[1], int) and T > 1 and not hasattr(self, "conv_hist"):
+      self.conv_hist = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1+T, self.conv_channels, device=x.device).clone()
+      self.rec_hist = Tensor.zeros(x.shape[0], self.num_v_heads, T-1, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+
+  def rollback(self, kept:int) -> list[Tensor]:
+    # after a verify pass over T tokens, keep only the first `kept` (1 <= kept < T): the conv state is the window's columns that
+    # followed them, the recurrent state the one saved after them
+    return [self.conv_state.assign(self.conv_hist[:, kept:kept+self.ssm_conv_kernel-1]), self.recurrent_state.assign(self.rec_hist[:, :, kept-1])]
 
 class HostEmbedding:
   """
@@ -440,6 +456,22 @@ class HostEmbedding:
     if not isinstance(T, int): raw = raw.pad_to(raw.max_shape)
     x = ggml_data_to_tensor(raw.flatten(), prod(raw.shape[:2]) * self.dim, self.ggml_type).reshape(*raw.shape[:2], self.dim)
     return x if isinstance(T, int) else x[:, :T]
+
+class MTPHead:
+  """
+  Qwen3.5's multi-token-prediction layer (GGUF `blk.N.nextn.*`): from the main model's final normed hidden state at position i and
+  the embedding of token i+1, one more transformer block predicts token i+2. Used as the draft model for speculative decoding.
+  """
+  def __init__(self, config:TransformerConfig):
+    self.eh_proj = Linear(2*config.dim, config.dim, bias=False)
+    self.enorm, self.hnorm = nn.RMSNorm(config.dim, config.norm_eps), nn.RMSNorm(config.dim, config.norm_eps)
+    self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
+    self.block = TransformerBlock(replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0,
+                                          hidden_dim=config.dense_hidden_dim or config.hidden_dim))
+
+  def __call__(self, hidden:Tensor, embeds:Tensor, start_pos:int|UOp) -> Tensor:
+    x = self.eh_proj(self.enorm(embeds).cat(self.hnorm(hidden), dim=-1))
+    return self.shared_head_norm(self.block(x, start_pos))
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -465,6 +497,9 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
     # prompt chunks before the last one only fill the caches: no output projection (the 248k-row LM head is ~5% of a chunk)
     self.prefill_body_jit = TinyJit(self.forward_body)
+    # speculative decoding with the MTP layer as the draft (see generate)
+    self.mtp: MTPHead|None = None
+    self.spec_stats = [0, 0]  # drafts proposed, accepted
 
   # with a host embedding, `tokens` is the packed embedding rows (B, T, row_bytes) instead of the token ids (B, T)
   def embed(self, tokens:Tensor) -> Tensor:
@@ -486,17 +521,63 @@ class Transformer:
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
 
+  # ******** speculative decoding ********
+
+  @staticmethod
+  def _sample(logits:Tensor, temperature:Tensor) -> Tensor:
+    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
+
+  def forward_hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    # a prompt chunk that also feeds the MTP layer: the final normed hidden states, no output projection
+    x = self.embed(tokens)
+    for block in self.blk: x = block(x, start_pos)
+    return self.output_norm(x).contiguous()
+
+  def forward_hidden_sample(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
+    # the last prompt chunk: hidden states and the first sampled token
+    h = self.forward_hidden(tokens, start_pos)
+    return h, self._sample(self.output(h[:, -1:])[:, -1, :], temperature).reshape(1, 1)
+
+  def forward_verify(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor]:
+    # [last token, draft tokens...] -> a sample at every position (B, T) and the hidden states (B, T, D)
+    for b in self._recurrent_blocks(): b.keep_history = True
+    try: h = self.forward_hidden(tokens, start_pos)
+    finally:
+      for b in self._recurrent_blocks(): b.keep_history = False
+    return self._sample(self.output(h), temperature).contiguous(), h
+
+  def forward_draft(self, hidden:Tensor, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    # the MTP layer over (hidden[i], token[i+1]) pairs at positions start_pos.., greedy draft from the last one: a deterministic draft
+    # keeps sampling exact (accept iff the target's own sample equals it)
+    x = cast(MTPHead, self.mtp)(hidden, self.embed(tokens), start_pos)
+    return self.output(x[:, -1:])[:, -1, :].argmax(-1).reshape(1, 1)
+
+  def forward_draft_fill(self, hidden:Tensor, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    # prompt chunks: only fill the MTP layer's KV cache
+    return cast(MTPHead, self.mtp)(hidden, self.embed(tokens), start_pos)[:, -1:, :1].contiguous()
+
+  def _rollback(self) -> Tensor:
+    # keep only the first of the two verified tokens
+    return Tensor.stack(*[t.flatten()[0] for b in self._recurrent_blocks() for t in b.rollback(1)])
+
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # HOST_EMBD: leave the token embedding in the file (see HostEmbedding) and skip the multi-token-prediction layers, which
     # nothing here runs: 0.9 GB of device memory on Qwen3.8-27B
+    # SPEC (default on): load the first MTP layer for speculative decoding, from this file or (for quants that dropped it, like
+    # GSQ-RCO IQ3_S) from MTP_GGUF, another GGUF of the same model
+    def first_mtp(kv:dict) -> int:
+      arch = kv['general.architecture']
+      return kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
+    spec = bool(getenv("SPEC", 1))
     host_embd = None
     if getenv("HOST_EMBD", 0) and not isinstance(gguf, Tensor):
       def skip(kv:dict, name:str) -> bool:
-        arch = kv['general.architecture']
-        first_mtp = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
-        return name == 'token_embd.weight' or (name.startswith('blk.') and int(name.split('.')[1]) >= first_mtp)
+        if name == 'token_embd.weight': return True
+        if not name.startswith('blk.'): return False
+        layer = int(name.split('.')[1])
+        return layer >= first_mtp(kv) and not (spec and layer == first_mtp(kv))
       kv, state_dict, skipped = gguf_load_partial(gguf, skip)
       embd_offset, embd_dims, embd_type = skipped['token_embd.weight']
       if 'output.weight' in state_dict: host_embd = HostEmbedding(gguf, embd_offset, embd_dims, embd_type)
@@ -513,6 +594,23 @@ class Transformer:
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
+
+    # the MTP layer's tensors: blk.N.nextn.* -> mtp.*, the rest of blk.N -> mtp.block.*
+    mtp_state: dict[str, Tensor] = {}
+    if spec:
+      prefix = f"blk.{first_mtp(kv)}."
+      if not any(k.startswith(prefix) for k in state_dict) and (mtp_path := getenv("MTP_GGUF", "")):
+        def skip_main(kv:dict, name:str) -> bool: return not name.startswith(f"blk.{first_mtp(kv)}.")
+        mtp_kv, extra, _ = gguf_load_partial(mtp_path, skip_main)
+        assert mtp_kv[f"{mtp_kv['general.architecture']}.embedding_length"] == kv[f"{kv['general.architecture']}.embedding_length"]
+        prefix = f"blk.{first_mtp(mtp_kv)}."
+        state_dict.update({k:v.cast('float16') if getenv("HALF", 1) else v for k,v in extra.items()})
+      for k in [k for k in state_dict if k.startswith(prefix)]:
+        name = k[len(prefix):].replace('post_attention_norm', 'ffn_norm')
+        mtp_state[name[len('nextn.'):] if name.startswith('nextn.') else 'block.'+name] = state_dict.pop(k)
+      if 'eh_proj.weight' not in mtp_state: mtp_state = {}
+    else:
+      for k in [k for k in state_dict if k.startswith('blk.') and int(k.split('.')[1]) >= first_mtp(kv)]: state_dict.pop(k)
 
     arch = kv['general.architecture']
     max_context = min(max_context, kv[f'{arch}.context_length']) if max_context is not None else kv[f'{arch}.context_length']
@@ -581,6 +679,9 @@ class Transformer:
     model = Transformer(config)
     if host_embd is not None: model.token_embd, model.host_embd = None, host_embd
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    if mtp_state:
+      model.mtp = MTPHead(replace(config, qk_norm=config.head_dim) if config.ssm else config)
+      nn.state.load_state_dict(model.mtp, mtp_state, verbose=False, consume=True, realize=False)
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
@@ -592,6 +693,17 @@ class Transformer:
     # a two-chunk prompt captures both prefill paths (cache-filling chunks without the head, and the last chunk), each runs once
     # per prompt; different tokens each time so nothing is reused from the cache
     for i in range(2): list(zip(range(2), self.generate([1+i]*(getenv("PREFILL_CHUNK", 32)+8))))
+    if self.mtp is not None and getenv("SPEC", 1):
+      # every speculative path (draft over 1 or 2 pairs, verify, rollback) captured before the first request, whatever got accepted
+      list(zip(range(8), self.generate([3, 4, 5])))
+      v, temp = UOp.variable("start_pos", 0, self.max_context-1), Tensor([0.0])
+      for _ in range(3):
+        ys, h = self.verify_jit(self._spec_input([1, 2], 2), v.bind(10), temp)
+        for n in (1, 2):
+          self.draft_h[n].assign(h[:, :n]).realize()
+          self.draft_jits[n](self.draft_h[n], self._spec_input([1, 2][:n], n), v.bind(9)).realize()
+        self.rollback_jit().realize()
+      self.spec_stats = [0, 0]
     self._cached_tokens, self._checkpoint_tokens = [], []
 
   def get_start_pos(self, tokens:list[int]) -> int:
@@ -646,6 +758,9 @@ class Transformer:
       # positions from start_pos on get rewritten, so a checkpoint past that point no longer matches the caches
       if start_pos < len(self._checkpoint_tokens): self._checkpoint_tokens = []
     if checkpoint is not None and not (start_pos < checkpoint < len(tokens)): checkpoint = None
+    if self.mtp is not None and getenv("SPEC", 1):
+      yield from self._generate_spec(tokens, start_pos, chunk_size, temp, checkpoint, on_prefill, v_start_pos, v_toks)
+      return
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
@@ -664,3 +779,76 @@ class Transformer:
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
+
+  def _spec_input(self, ids:list[int], pad_to:int) -> Tensor:
+    if self.host_embd is not None: return self.host_embd.rows(ids, pad_to, self.output_norm.weight.device)
+    return Tensor(ids + [0] * (pad_to - len(ids)), dtype="int32", device=self.output_norm.weight.device).reshape(1, pad_to)
+
+  def _generate_spec(self, tokens:list[int], start_pos:int, chunk_size:int, temp:Tensor, checkpoint:int|None,
+                     on_prefill:Callable[[int], None]|None, v_start_pos:UOp, v_toks:UOp):
+    """
+    Speculative decoding with the MTP layer as a one-token draft. Each step: the MTP layer drafts d from the last hidden state and
+    token x, then the main model runs [x, d] and samples at both positions. The draft is greedy, so taking the target's sample y0
+    at x's position and accepting d iff y0 == d is exact sampling. Accepted: emit d and the sample after it. Rejected: emit y0 and
+    roll the recurrent state back to after x (the attention KV cache past it is simply overwritten later).
+    """
+    if not hasattr(self, "spec_body_jit"):
+      self.spec_body_jit, self.spec_last_jit = TinyJit(self._spec_prefill_body), TinyJit(self._spec_prefill_last)
+      self.verify_jit, self.rollback_jit = TinyJit(self.forward_verify), TinyJit(self._rollback)
+      self.draft_jits = {1: TinyJit(self.forward_draft), 2: TinyJit(self.forward_draft)}
+      dim, device = self.output_norm.weight.shape[0], self.output_norm.weight.device
+      self.draft_h = {n: Tensor.zeros(1, n, dim, device=device).contiguous().realize() for n in (1, 2)}
+    # prompt: chunks also fill the MTP layer's cache with (hidden[i], token[i+1]); the last chunk's final pair has no next token yet,
+    # so it gets a padding token, rewritten by the first draft step at the same position
+    prompt_len = len(tokens)
+    while True:
+      n_toks = min(chunk_size, prompt_len - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      cur, nxt = self._spec_input(tokens[start_pos:start_pos+n_toks], chunk_size), self._spec_input(tokens[start_pos+1:start_pos+n_toks+1], chunk_size)
+      last = start_pos + n_toks == prompt_len
+      if last: x, h, _ = self.spec_last_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp, temp)
+      else: self.spec_body_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp).realize()
+      start_pos += n_toks
+      if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
+      if last: break
+      if on_prefill is not None: on_prefill(start_pos)
+    tok = int(x.item())
+    tokens.append(tok)
+    self._cached_tokens = tokens[:-1]
+    yield tok
+    # decode. p: position of the newest token (sampled, not yet run); pending: (hidden, token) pairs the MTP layer hasn't seen
+    p, pending_h, pending, mtp_pos = prompt_len, h, [tok], prompt_len-1
+    while p + 2 <= self.max_context:
+      # the hidden states go through a fixed buffer: JIT outputs and slices of them reach the draft JIT as different views
+      hin = self.draft_h[len(pending)]
+      hin.assign(pending_h.reshape(hin.shape)).realize()
+      draft = int(self.draft_jits[len(pending)](hin, self._spec_input(pending, len(pending)), v_start_pos.bind(mtp_pos)).item())
+      ys, h = self.verify_jit(self._spec_input([tokens[-1], draft], 2), v_start_pos.bind(p), temp)
+      y0, y1 = ys.tolist()[0]
+      self.spec_stats[0] += 1
+      if y0 == draft:
+        self.spec_stats[1] += 1
+        tokens.append(draft)
+        self._cached_tokens = tokens[:]
+        yield draft
+        tokens.append(y1)
+        self._cached_tokens = tokens[:-1]
+        yield y1
+        pending_h, pending, mtp_pos, p = h, [draft, y1], p, p+2
+      else:
+        self.rollback_jit().realize()
+        tokens.append(y0)
+        self._cached_tokens = tokens[:-1]
+        yield y0
+        pending_h, pending, mtp_pos, p = h[:, :1], [y0], p, p+1
+
+  def _spec_prefill_body(self, tokens:Tensor, next_tokens:Tensor, start_pos:int|UOp) -> Tensor:
+    h = self.forward_hidden(tokens, start_pos)
+    return self.forward_draft_fill(h, next_tokens, start_pos)
+
+  def _spec_prefill_last(self, tokens:Tensor, next_tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    h = self.forward_hidden(tokens, start_pos)
+    fill = self.forward_draft_fill(h, next_tokens, start_pos)
+    last = h[:, -1:]
+    x = self._sample(self.output(last)[:, -1, :], temperature).reshape(1, 1)
+    return x.contiguous(), last.contiguous(), fill

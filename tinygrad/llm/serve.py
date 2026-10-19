@@ -120,14 +120,19 @@ class Handler(HTTPRequestHandler):
     status.update(force=True, phase="prefill", id=tmpl["id"], prompt=prompt_tokens, cached=cache_start_pos, done=cache_start_pos,
                   start=time.time(), gen=0, max_tokens=max_tokens)
     prefill_tps = 0.0
+    def spec_stats() -> list[int]: return list(s) if isinstance(s:=getattr(model, "spec_stats", None), list) else [0, 0]
+    spec_start = spec_stats()
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
       gen_tps = len(out)/(et-pt) if len(out) > 1 else 0
-      stderr_log(f"gen:{gen_tps:4.0f} tok/s  {colored('--', 'BLACK')}  "
+      # speculative decoding: share of the MTP drafts the model accepted during this request
+      drafts, accepted = (b-a for a,b in zip(spec_start, spec_stats()))
+      acc = f"draft acc:{accepted/drafts:4.0%}  {colored('--', 'BLACK')}  " if drafts else ""
+      stderr_log(f"gen:{gen_tps:4.0f} tok/s  {colored('--', 'BLACK')}  {acc}"
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
       last = {"id":tmpl["id"], "end":time.time(), "prompt":prompt_tokens, "cached":cache_start_pos, "prefill_tps":prefill_tps,
-              "gen":len(out), "gen_tps":gen_tps, "total_s":et-st, "interrupted":interrupted}
+              "gen":len(out), "gen_tps":gen_tps, "total_s":et-st, "interrupted":interrupted, "drafts":drafts, "accepted":accepted}
       status.update(force=True, phase="idle", completed=status.state["completed"]+1, last=last,
                     history=(status.state.get("history") or [])[-29:] + [last])
     completed, last_sent = False, time.perf_counter()

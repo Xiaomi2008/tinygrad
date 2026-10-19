@@ -74,8 +74,11 @@ class Linear(nn.Linear):
     raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
     if raw is None: return
     ggml_type = packed_sizes[prod(raw.shape)]
+    # the dequant reshapes the bytes into the type's blocks: tells apart types with the same size per 256 weights (Q4_0 and Q4_K)
+    topo = decoded.uop.toposort()
+    if any(u.op is Ops.RESHAPE and u.src[0] is raw and u.shape[-1] != QUANT_SIZES[ggml_type] for u in topo): return
     # IQ3_S also packs 256 weights in 110 bytes, but its dequant reads a grid table: Q3_K's reads nothing but the packed weights
-    if ggml_type == Q3_K and any(u.op is Ops.BUFFER and u is not raw.buf_uop for u in decoded.uop.toposort()): ggml_type = IQ3_S
+    if ggml_type == Q3_K and any(u.op is Ops.BUFFER and u is not raw.buf_uop for u in topo): ggml_type = IQ3_S
     # a type without a kernel on this device keeps its decoded weight for the generic path
     if allowed is not None and ggml_type not in allowed: return
     raw_offset = raw.contiguous_view_offset()
@@ -924,8 +927,11 @@ def flash_attention_nv(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, kv_scale
 # ******** gated delta net: fused recurrent scan ********
 
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
-                                cuda:bool=False) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, *hist_start:UOp,
+                                cuda:bool=False, hist:bool=False) -> UOp:
+  # hist: an extra output (after state) gets the state after each token but the last, for rolling back rejected speculative tokens
+  hist_buf, start_pos = (hist_start[0], hist_start[1:]) if hist else (None, hist_start)
+  start_pos = start_pos[0] if start_pos else None
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
@@ -934,6 +940,7 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
   beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
+  if hist_buf is not None: hist_buf = hist_buf.reshape(batch*heads, tokens-1, value_dim, key_dim)
   bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
   rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
@@ -951,26 +958,32 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
     state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True, cuda=cuda)
     state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True, cuda=cuda)
     delta = (v[bh, token, row].load() - state_k*av) * bv
-    updates += [x*av + delta*y for x,y in zip(previous, keys)]
+    row_updates = [x*av + delta*y for x,y in zip(previous, keys)]
+    updates += row_updates
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
+    if hist_buf is not None:
+      stores += [hist_buf[bh, token.minimum(tokens-2), row, col.valid(token < tokens-1)].store(x) for x,col in zip(row_updates, cols)]
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
   state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
   return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill", opts_to_apply=()))
 
-def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
+def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None,
+                        hist:Tensor|None=None) -> Tensor:
+  # hist (batch, heads, tokens-1, value_dim, key_dim) float32: also store the state after each token but the last
   batch, heads, tokens, key_dim = q.shape
   value_dim = v.shape[-1]
   assert q.shape == k.shape and v.shape[:3] == beta.shape == (batch, heads, tokens) and state.shape == (batch, heads, value_dim, key_dim)
   assert alpha.shape[:3] == (batch, heads, tokens) and (len(alpha.shape) == 3 or alpha.shape[-1] in (1, value_dim))
   assert key_dim % 32 == 0 and value_dim % 4 == 0
   core, kq = Tensor.empty_like(v), (q*k).sum(-1).contiguous()
-  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq)
-  cuda = _device_name(q.device) == "NV"
-  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, cuda=cuda))[0]
+  srcs = (core, q.contiguous(), k.contiguous(), v.contiguous(), beta.contiguous(), alpha.contiguous(), state, kq, *([hist] if hist is not None else []))
+  cuda, has_hist = _device_name(q.device) == "NV", hist is not None
+  if has_hist: assert hist.shape == (batch, heads, tokens-1, value_dim, key_dim) and hist.dtype == dtypes.float32
+  if start_pos is None: return Tensor.custom_kernel(*srcs, fxn=functools.partial(_gated_delta_prefill_kernel, cuda=cuda, hist=has_hist))[0]
   contig = tuple(x.uop if x.uop.op is Ops.AFTER else x.uop.contiguous() for x in srcs)
   params = tuple(UOp.placeholder_like(x, slot=i) for i,x in enumerate(contig))
   assert start_pos.uop.is_bound_var
   # the bound start_pos reaches the graph through the state AFTER chain, like the flash kernels' valid_end
-  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0]), cuda=cuda).call(*contig)
+  call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0]), cuda=cuda, hist=has_hist).call(*contig)
   return Tensor(contig[0].after(call))
