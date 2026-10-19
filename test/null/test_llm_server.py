@@ -107,7 +107,8 @@ class TestLLMServer(unittest.TestCase):
         {"role":"tool", "tool_call_id":"call_1", "content":"result"},
       ], stream=True)
       self.assertEqual(list(response)[-1].choices[0].finish_reason, "stop")
-      self.mock_tok.encode.assert_called_with('<|im_start|>user\nHello world<|im_end|>\n'
+      # any call: the server also encodes the prompt up to the last user message, for the recurrent-state checkpoint
+      self.mock_tok.encode.assert_any_call('<|im_start|>user\nHello world<|im_end|>\n'
                                               '<|im_start|>assistant\n<|im_end|>\n<|im_start|>tool\nresult<|im_end|>\n')
 
   def test_content_is_streamed(self):
