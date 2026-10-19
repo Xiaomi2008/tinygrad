@@ -1,7 +1,7 @@
 from __future__ import annotations
-import json, pathlib, re, time, typing, uuid
+import json, os, pathlib, re, tempfile, time, typing, uuid
 from typing import TYPE_CHECKING
-from tinygrad.helpers import DEBUG, colored, stderr_log
+from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -63,6 +63,26 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+STATUS_FILE = pathlib.Path(getenv("LLM_STATUS_FILE", str(pathlib.Path(tempfile.gettempdir()) / "tinyllm_status.json")))
+
+class LiveStatus:
+  """The request in progress (prefill position, tokens generated) and the last finished one, rewritten a few times a second to
+  STATUS_FILE for `python -m tinygrad.llm.monitor`. LLM_STATUS=0 turns it off."""
+  def __init__(self, **info):
+    self.path = STATUS_FILE if getenv("LLM_STATUS", 1) else None
+    self.state: dict[str, typing.Any] = {"phase":"idle", "completed":0, "last":None, "pid":os.getpid(), **info}
+    self.written = 0.0
+    self.write()
+  def update(self, force:bool=False, **kw):
+    self.state.update(kw)
+    if force or time.perf_counter() - self.written >= 0.2: self.write()
+  def write(self):
+    if self.path is None: return
+    self.state["updated"], self.written = time.time(), time.perf_counter()
+    tmp = self.path.with_name(self.path.name + ".tmp")
+    tmp.write_text(json.dumps(self.state))
+    os.replace(tmp, self.path)
+
 class Handler(HTTPRequestHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -82,19 +102,31 @@ class Handler(HTTPRequestHandler):
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
     router = StreamRouter(reasoning)
+    status = self.server.status
+    status.update(force=True, phase="prefill", id=tmpl["id"], prompt=prompt_tokens, cached=cache_start_pos, done=cache_start_pos,
+                  start=time.time(), gen=0, max_tokens=max_tokens)
+    prefill_tps = 0.0
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
-      stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
+      gen_tps = len(out)/(et-pt) if len(out) > 1 else 0
+      stderr_log(f"gen:{gen_tps:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
+      last = {"id":tmpl["id"], "end":time.time(), "prompt":prompt_tokens, "cached":cache_start_pos, "prefill_tps":prefill_tps,
+              "gen":len(out), "gen_tps":gen_tps, "total_s":et-st, "interrupted":interrupted}
+      status.update(force=True, phase="idle", completed=status.state["completed"]+1, last=last,
+                    history=(status.state.get("history") or [])[-29:] + [last])
     completed = False
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint):
+      for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint, on_prefill=lambda pos: status.update(done=pos)):
         if len(out) == 0:
-          stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
+          prefill_tps = (prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st)
+          stderr_log(f"prefill:{prefill_tps:4.0f} tok/s  {colored('--', 'BLACK')}  ")
+          status.update(force=True, phase="decode", done=prompt_tokens, prefill_tps=prefill_tps, decode_start=time.time())
         if tok.is_end(next_id): break
         out.append(next_id)
+        status.update(gen=len(out))
         for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
@@ -176,4 +208,5 @@ class Handler(HTTPRequestHandler):
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.status = LiveStatus(model=model_name, max_context=model.max_context)
     super().__init__(server_address, Handler)

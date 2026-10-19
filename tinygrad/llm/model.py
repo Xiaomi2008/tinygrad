@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, mmap, pathlib
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Callable, cast
 from tinygrad.helpers import prod
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, flash_attention_nv, _device_name, amd_custom_kernels_supported, gated_delta_kernel_supported
@@ -622,7 +622,9 @@ class Transformer:
     for b, (conv, rec) in zip(self._recurrent_blocks(), self._checkpoint_state):
       Tensor.realize(b.conv_state.assign(conv), b.recurrent_state.assign(rec))
 
-  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, checkpoint:int|None=None):
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, checkpoint:int|None=None,
+               on_prefill:Callable[[int], None]|None=None):
+    # on_prefill(start_pos) after each prompt chunk is queued: progress for a status display
     if chunk_size is None: chunk_size = getenv("PREFILL_CHUNK", 32)
     if self.has_recurrent_block and not gated_delta_kernel_supported(self.output_norm.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
@@ -656,7 +658,9 @@ class Transformer:
       start_pos += n_toks
       if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
       # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
+      if start_pos < len(tokens):
+        if on_prefill is not None: on_prefill(start_pos)
+        continue
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
