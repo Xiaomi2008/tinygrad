@@ -17,7 +17,7 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
 
 # quant types {ggml_type: (number of elements, number of bytes)}
-_GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
+_GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 11:(256,110),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
@@ -27,7 +27,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   Supported native types: float32 (id: 0), float16 (id: 1), int8 (id: 24),
   int16 (id: 25), int32 (id: 26), int64 (id: 27), float64 (id: 28), bfloat16 (id: 30)
   Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6),
-  Q5_1 (id: 7), Q8_0 (id: 8), Q4_K (id: 12), Q5_K (id: 13),
+  Q5_1 (id: 7), Q8_0 (id: 8), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
   Q6_K (id: 14), IQ3_XXS (id: 18), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), MXFP4 (id: 39), Q1_0 (id: 41)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
@@ -65,6 +65,18 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
       return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
+    # Q3_K: 256 elements per 110-byte block (hmask:32, qs:64, scales:12, d:2); element (h, j, l) = (e//128, e%128//32, e%32) takes
+    # bits 2j of qs[32h+l], high bit 4h+j of hmask[l] (clear means -4), and 6-bit scale 8h+2j+l//16 (minus 32)
+    if ggml_type == 11:
+      d = blocks[:,108:110].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1, 1))
+      q = blocks[:,32:96].reshape((-1, 2, 1, 32)).rshift(Tensor.const((0, 2, 4, 6), dtypes.uint8).reshape((1, 1, 4, 1))).bitwise_and(3)
+      hbit = blocks[:,0:32].reshape((-1, 1, 32)).rshift(Tensor.const(tuple(range(8)), dtypes.uint8).reshape((1, 8, 1))).bitwise_and(1)
+      q = q.cast(dtypes.int8) + hbit.reshape((-1, 2, 4, 32)).cast(dtypes.int8) * 4 - 4
+      s = blocks[:,96:108]
+      lo = s[:,0:8].bitwise_and(0xF).cat(s[:,0:8].rshift(4), dim=-1)
+      hi = s[:,8:12].reshape((-1, 1, 4)).rshift(Tensor.const((0, 2, 4, 6), dtypes.uint8).reshape((1, 4, 1))).bitwise_and(3).reshape((-1, 16))
+      sc = (lo.bitwise_or(hi.lshift(4)).cast(dtypes.int8) - 32).cast(dtypes.float32).reshape((-1, 2, 4, 2, 1))
+      return (d * sc * q.reshape((-1, 2, 4, 2, 16)).cast(dtypes.float32)).flatten(-4)
     if ggml_type == 14:
       xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
       scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
