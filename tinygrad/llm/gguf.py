@@ -17,8 +17,9 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
                 26: dtypes.int32, 27: dtypes.int64, 28: dtypes.float64, 30: dtypes.bfloat16}
 
 # quant types {ggml_type: (number of elements, number of bytes)}
-_GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 11:(256,110),
-               12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
+_GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 10:(256,84), 11:(256,110),
+               12:(256,144), 13:(256,176), 14:(256,210), 16:(256,66), 17:(256,74), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136),
+               29:(256,56), 39:(32,17), 41:(128,18)}
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -27,8 +28,9 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   Supported native types: float32 (id: 0), float16 (id: 1), int8 (id: 24),
   int16 (id: 25), int32 (id: 26), int64 (id: 27), float64 (id: 28), bfloat16 (id: 30)
   Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6),
-  Q5_1 (id: 7), Q8_0 (id: 8), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
-  Q6_K (id: 14), IQ3_XXS (id: 18), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23), MXFP4 (id: 39), Q1_0 (id: 41)
+  Q5_1 (id: 7), Q8_0 (id: 8), Q2_K (id: 10), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
+  Q6_K (id: 14), IQ2_XXS (id: 16), IQ2_XS (id: 17), IQ3_XXS (id: 18), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23),
+  IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
@@ -91,6 +93,42 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
       grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
+    if ggml_type == 16:
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
+      aux = blocks[:, 2:66].bitcast(dtypes.uint32).reshape((-1, 8, 2))[:, :, 1]
+      db = d * (aux.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.25
+      sign_idx = aux.unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
+      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
+      grid = _ggml_iq_grid(t.device, _ggml.iq2xxs_grid, (256, 8))[blocks[:, 2:66].reshape((-1, 8, 8))[:, :, :4]].reshape((-1, 8, 4, 8))
+      return (db * grid * signs).flatten(-3)
+    if ggml_type == 17:
+      d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
+      qs = blocks[:, 2:66].bitcast(dtypes.uint16)
+      db = d * (q_to_uint8(blocks[:, 66:74].reshape((-1, 8, 1)), 4).reshape((-1, 16)).cast(dtypes.float32) + 0.5).reshape((-1, 16, 1, 1)) * 0.25
+      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
+      signs = (q_to_uint8(even_signs[qs.rshift(9).cast(dtypes.int32)].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 16, 2, 8))
+      grid = _ggml_iq_grid(t.device, _ggml.iq2xs_grid, (512, 8))[qs.bitwise_and(511)].reshape((-1, 16, 2, 8))
+      return (db * grid * signs).flatten(-3)
+    # IQ1_M: 256 elements per 56-byte block (qs:32, qh:16, scales:8); the fp16 block scale is spread over the top nibbles of the scales
+    if ggml_type == 29:
+      sc = blocks[:, 48:56].bitcast(dtypes.uint16)
+      top = sc.rshift(12)
+      d = (top[:, 0] + top[:, 1].lshift(4) + top[:, 2].lshift(8) + top[:, 3].lshift(12)).bitcast(dtypes.float16).cast(dtypes.float32)
+      sub = sc.unsqueeze(-1).rshift(Tensor.const((0, 3, 6, 9), dtypes.uint16)).bitwise_and(7).reshape((-1, 16)).cast(dtypes.float32)
+      dl = (d.reshape((-1, 1)) * (2 * sub + 1)).reshape((-1, 8, 2, 1, 1))
+      qh = q_to_uint8(blocks[:, 32:48].reshape((-1, 16, 1)), 4).reshape((-1, 32))
+      q = blocks[:, :32].cast(dtypes.uint16) + qh.bitwise_and(7).cast(dtypes.uint16).lshift(8)
+      delta = (qh.bitwise_and(8) == 0).where(0.125, -0.125).reshape((-1, 8, 2, 2, 1))
+      grid = _ggml_iq_grid(t.device, _ggml.iq1s_grid, (2048, 8))
+      grid = (grid > 127).where(grid - 256, grid)  # the grid bytes are int8 -1/0/1
+      return (dl * (grid[q].reshape((-1, 8, 2, 2, 8)) + delta)).flatten(-4)
+    if ggml_type == 10:
+      d = blocks[:, 80:82].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
+      dmin = blocks[:, 82:84].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
+      sc = blocks[:, :16]
+      q = q_to_uint8(blocks[:, 16:80].reshape((-1, 2, 32)), 2).reshape((-1, 16, 16)).cast(dtypes.float32)
+      return (d * sc.bitwise_and(0xF).cast(dtypes.float32).unsqueeze(-1) * q - dmin * sc.rshift(4).cast(dtypes.float32).unsqueeze(-1)).flatten(-2)
     if ggml_type == 21:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
       scales = (1 + 2 * q_to_uint8(blocks[:, 106:110].reshape((-1, 4, 1)), 4).reshape((-1, 8))).cast(dtypes.float32).reshape((-1, 8, 1, 1))

@@ -63,10 +63,11 @@ class Linear(nn.Linear):
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
-  def set_quantized(self, decoded:Tensor):
+  def set_quantized(self, decoded:Tensor, allowed:tuple[int, ...]|None=None):
     packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()}
     raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
-    if raw is None: return
+    # a type without a kernel on this device keeps its decoded weight for the generic path
+    if raw is None or (allowed is not None and packed_sizes[prod(raw.shape)] not in allowed): return
     # IQ3_S also packs 256 weights in 110 bytes, but its dequant reads a grid table: Q3_K's reads nothing but the packed weights
     if packed_sizes[prod(raw.shape)] == Q3_K and any(u.op is Ops.BUFFER and u is not raw.buf_uop for u in decoded.uop.toposort()): return
     raw_offset = raw.contiguous_view_offset()
@@ -80,10 +81,11 @@ class Linear(nn.Linear):
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and (amd_custom_kernels_supported(self.weight.device) or
                                            (_device_name(self.weight.device) == "NV" and bool(getenv("NV_Q8_LINEAR", 1))))
+    fast_types = (Q3_K, Q4_K, Q5_K, Q6_K) if _device_name(self.weight.device) == "NV" else (Q4_K, Q5_K, Q6_K, IQ4_XS)
     if self.ggml_type is None and supported:
-      self.set_quantized(self.weight)
+      self.set_quantized(self.weight, fast_types)
       if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in ((Q3_K, Q4_K, Q5_K, Q6_K) if _device_name(self.weight.device) == "NV" else (Q4_K, Q5_K, Q6_K, IQ4_XS)) and supported:
+    if self.ggml_type in fast_types and supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
