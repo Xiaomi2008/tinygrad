@@ -1,4 +1,4 @@
-import math, time, traceback, signal, hashlib
+import math, time, traceback, signal, hashlib, threading
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
@@ -55,8 +55,11 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise TimeoutException()
 
+# the compile timeout uses SIGALRM, which only the main thread can set (the LLM server captures JITs in its request threads)
+def _use_alarm() -> bool: return hasattr(signal, "alarm") and threading.current_thread() is threading.main_thread()
+
 def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
-  if hasattr(signal, "alarm"):
+  if _use_alarm():
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
     signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
@@ -79,7 +82,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   except Exception as e:
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
-    if hasattr(signal, "alarm"): signal.alarm(0)
+    if _use_alarm(): signal.alarm(0)
   return x[0], ret
 
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]

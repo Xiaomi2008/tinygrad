@@ -5,7 +5,8 @@ from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
-  from tinygrad.llm.model import Transformer
+  from tinygrad.llm.model import Transformer, PromptImage
+  from tinygrad.llm.vision import VisionEncoder, Image
 
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
@@ -34,6 +35,20 @@ def normalize_messages(messages:list[dict]) -> None:
     # string-only templates need text parts joined and explicit null content emptied
     if m.get("content", "") is None: m["content"] = ""
     elif isinstance(c := m.get("content"), list) and all(p.get("type") == "text" for p in c): m["content"] = "".join(p["text"] for p in c)
+
+def image_urls(messages:list[dict]) -> list[str]:
+  # the images in the order the chat template renders them: OpenAI image_url parts, or {"type": "image", "image": url}
+  urls = []
+  for m in messages:
+    if not isinstance(c := m.get("content"), list): continue
+    for part in c:
+      if not isinstance(part, dict): continue
+      if "image_url" in part: urls.append(u["url"] if isinstance(u := part["image_url"], dict) else u)
+      elif part.get("type") == "image" or "image" in part:
+        if isinstance(src := part.get("source"), dict) and src.get("type") == "base64":  # Anthropic-style
+          urls.append(f"data:{src.get('media_type', 'image/png')};base64,{src['data']}")
+        else: urls.append(part.get("image") or part.get("url") or "")
+  return urls
 
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
@@ -104,7 +119,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, checkpoint:int|None=None):
+                reasoning:bool=False, checkpoint:int|None=None, images:list[PromptImage]|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -138,7 +153,8 @@ class Handler(HTTPRequestHandler):
     completed, last_sent = False, time.perf_counter()
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint, on_prefill=lambda pos: status.update(done=pos)):
+      for next_id in model.generate(ids, temperature=temperature, checkpoint=checkpoint, on_prefill=lambda pos: status.update(done=pos),
+                                    images=images):
         if len(out) == 0:
           prefill_tps = (prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st)
           stderr_log(f"prefill:{prefill_tps:4.0f} tok/s  {colored('--', 'BLACK')}  ")
@@ -182,6 +198,26 @@ class Handler(HTTPRequestHandler):
       if not completed: log_stats(interrupted=True)
       raise
 
+  def error(self, message:str, code:str="invalid_request_error", status:int=400):
+    stderr_log(f"{colored(message, 'red')}\n")
+    self.send_data(json.dumps({"error":{"message":message, "type":"invalid_request_error", "param":"messages", "code":code}}).encode(),
+                   status_code=status)
+
+  def expand_images(self, ids:list[int], images:list[Image]) -> tuple[list[int], list[PromptImage]]:
+    # each <|image_pad|> (one per image, in order) -> the image's grid of placeholder tokens: a negative id from its content hash, so
+    # the same image in the next request matches the cached prefix and a different one doesn't
+    from tinygrad.llm.model import PromptImage
+    vision, pad = self.server.vision, self.server.image_pad_id
+    out: list[int] = []
+    spans: list[PromptImage] = []
+    for t in ids:
+      if t == pad and len(spans) < len(images) and vision is not None:
+        im = images[len(spans)]
+        spans.append(PromptImage(len(out), im.gh, im.gw, lambda im=im, vision=vision: vision.encode(im)))
+        out += [-1 - int(im.key[:8], 16) % (1 << 30)] * im.n_tokens
+      else: out.append(t)
+    return out, spans
+
   def do_POST(self):
     # one request at a time on the model; GETs (/v1/models) are answered meanwhile, so clients' model discovery doesn't time out
     with self.server.model_lock: self._post()
@@ -196,14 +232,24 @@ class Handler(HTTPRequestHandler):
       normalize_messages(body["messages"])
       # extra template variables, e.g. {"enable_thinking": false} or Qwen3.8's {"reasoning_effort": "low"}
       template_kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
+      urls = image_urls(body["messages"])
+      if urls and self.server.vision is None: return self.error("this model has no vision encoder: start the server with MMPROJ=<mmproj gguf>")
+      try: images = [self.server.vision.prepare(u) for u in urls] if self.server.vision is not None else []
+      except Exception as e: return self.error(f"can't read image: {e}")
       rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, **template_kwargs)
       ids: list[int] = self.server.tok.encode(rendered)
+      if images:
+        if (n := ids.count(self.server.image_pad_id)) != len(images): return self.error(f"{len(images)} images but the prompt has {n} image slots")
+        ids, spans = self.expand_images(ids, images)
+        stderr_log(f"images:{len(images)} ({sum(im.n_tokens for im in images)} tok)  {colored('--', 'BLACK')}  ")
+      else: spans = []
       # checkpoint recurrent state at the end of the last user message: once the next user message arrives, chat templates re-render the
       # turns after it differently (qwen3.5 drops their thinking blocks), so that is the last point the next request is sure to share
       checkpoint = None
       if (last_user:=max((i for i,m in enumerate(body["messages"]) if m.get("role") == "user"), default=None)) is not None:
         prefix = self.server.tok.encode(self.server.template.render(messages=body["messages"][:last_user+1], tools=body.get("tools"),
                                                                     add_generation_prompt=False, **template_kwargs))
+        if images: prefix = self.expand_images(prefix, images)[0]
         if ids[:len(prefix)] == prefix: checkpoint = len(prefix)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
@@ -216,7 +262,7 @@ class Handler(HTTPRequestHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"), checkpoint=checkpoint)
+                              reasoning=rendered.rstrip().endswith("<think>"), checkpoint=checkpoint, images=spans)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -238,8 +284,10 @@ class Handler(HTTPRequestHandler):
 
 class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
   daemon_threads = True
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
-    self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
+               vision:VisionEncoder|None=None):
+    self.model, self.model_name, self.tok, self.template, self.vision = model, model_name, tok, template, vision
+    self.image_pad_id = tok._special_tokens.get("<|image_pad|>", -1)
     self.model_lock = threading.Lock()
     self.status = LiveStatus(model=model_name, max_context=model.max_context)
     super().__init__(server_address, Handler)

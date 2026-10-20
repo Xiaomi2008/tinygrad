@@ -232,6 +232,7 @@ class _DEV(ContextVar):
 DEV, DEBUG, BEAM, NOOPT = _DEV("DEV", ""), ContextVar("DEBUG", 0), ContextVar("BEAM", 0), ContextVar("NOOPT", 0)
 IMAGE, FLOAT16, OPENPILOT_HACKS = ContextVar("IMAGE", 0), ContextVar("FLOAT16", 0), ContextVar("OPENPILOT_HACKS", 0)
 JIT, JIT_BATCH_SIZE = ContextVar("JIT", 1), ContextVar("JIT_BATCH_SIZE", 32)
+JITBEAM = ContextVar("JITBEAM", -1)  # BEAM for JIT captures; -1: use BEAM
 CHUNK_SIZE = 2**20  # TinyFS content-addressed store: blob chunk + hash-tree node granularity
 WINO, CAPTURING, TRACEMETA, NO_COLOR = ContextVar("WINO", 0), ContextVar("CAPTURING", 1), ContextVar("TRACEMETA", 1), ContextVar("NO_COLOR", 0)
 TRAINING = ContextVar("TRAINING", 0)
@@ -403,7 +404,8 @@ def db_connection():
   global _db_connection
   if _db_connection is None:
     os.makedirs(CACHEDB.rsplit(os.sep, 1)[0], exist_ok=True)
-    _db_connection = sqlite3.connect(CACHEDB, timeout=60, isolation_level="IMMEDIATE")
+    # check_same_thread=False: the LLM server compiles in its request threads (one at a time, under its model lock)
+    _db_connection = sqlite3.connect(CACHEDB, timeout=60, isolation_level="IMMEDIATE", check_same_thread=False)
     # another connection has set it already or is in the process of setting it
     # that connection will lock the database
     with contextlib.suppress(sqlite3.OperationalError): _db_connection.execute("PRAGMA journal_mode=WAL").fetchone()

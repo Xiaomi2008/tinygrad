@@ -1,6 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, mmap, pathlib
 from dataclasses import dataclass, replace
+import typing
 from typing import Callable, cast
 from tinygrad.helpers import prod
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
@@ -18,7 +19,8 @@ class ExpertGating(enum.IntEnum):
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+  # realized: requests with images rewrite it in place (see Transformer.set_rope_layout), and the JITs must read it as a buffer
+  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device).realize()
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
@@ -82,6 +84,7 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  rope_sections: tuple[int, ...] = ()  # M-RoPE (Qwen3.5): rotary frequencies split between the (t, h, w) positions of image tokens
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -473,8 +476,20 @@ class MTPHead:
     x = self.eh_proj(self.enorm(embeds).cat(self.hnorm(hidden), dim=-1))
     return self.shared_head_norm(self.block(x, start_pos))
 
+@dataclass
+class PromptImage:
+  """An image's span in the prompt: tokens[start:start+gh*gw] are placeholders (negative ids, the same for the same image so prefix
+  caching works) for a gh x gw grid of embeddings, which embeds() returns as (gh*gw, D), on the host or any device."""
+  start: int
+  gh: int
+  gw: int
+  embeds: Callable[[], typing.Any]  # a Tensor or a numpy array
+  @property
+  def end(self) -> int: return self.start + self.gh * self.gw
+
 class Transformer:
   def __init__(self, config:TransformerConfig):
+    self.config = config
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
@@ -497,6 +512,10 @@ class Transformer:
     self.rollout_jit = TinyJit(self.forward)
     # prompt chunks before the last one only fill the caches: no output projection (the 248k-row LM head is ~5% of a chunk)
     self.prefill_body_jit = TinyJit(self.forward_body)
+    # prompt chunks with image tokens take embeddings instead of tokens; the RoPE table is laid out for the current prompt's images
+    self.prefill_x_jit, self.prefill_body_x_jit = TinyJit(self.forward_x), TinyJit(self.forward_body_x)
+    self._rope_key: tuple = ()
+    self._rope_default: Tensor|None = None
     # speculative decoding with the MTP layer as the draft (see generate)
     self.mtp: MTPHead|None = None
     self.spec_stats = [0, 0]  # drafts proposed, accepted
@@ -505,14 +524,16 @@ class Transformer:
   def embed(self, tokens:Tensor) -> Tensor:
     return (self.host_embd(tokens) if self.host_embd is not None else cast(nn.Embedding, self.token_embd)(tokens)).float()
 
-  def forward_body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    x = self.embed(tokens)
+  # the *_x variants take the input embeddings (B, T, D) instead of tokens: prompt chunks holding image tokens
+  def forward_body(self, tokens:Tensor, start_pos:int|UOp) -> Tensor: return self.forward_body_x(self.embed(tokens), start_pos)
+  def forward_body_x(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     for block in self.blk: x = block(x, start_pos)
     return x[:, -1:, :1].contiguous()
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.embed(tokens)                                # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    return self.forward_x(self.embed(tokens), start_pos, temperature)
+  def forward_x(self, x:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+    for block in self.blk: x = block(x, start_pos)        # (B, T, D)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
@@ -527,9 +548,9 @@ class Transformer:
   def _sample(logits:Tensor, temperature:Tensor) -> Tensor:
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1)
 
-  def forward_hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor:
+  def forward_hidden(self, tokens:Tensor, start_pos:int|UOp) -> Tensor: return self.forward_hidden_x(self.embed(tokens), start_pos)
+  def forward_hidden_x(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     # a prompt chunk that also feeds the MTP layer: the final normed hidden states, no output projection
-    x = self.embed(tokens)
     for block in self.blk: x = block(x, start_pos)
     return self.output_norm(x).contiguous()
 
@@ -675,7 +696,8 @@ class Transformer:
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict,
+      rope_sections=tuple(kv.get(f'{arch}.rope.dimension_sections', ())))
     model = Transformer(config)
     if host_embd is not None: model.token_embd, model.host_embd = None, host_embd
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -722,6 +744,55 @@ class Transformer:
 
   def _recurrent_blocks(self) -> list[GatedDeltaNetBlock]: return [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
 
+  # ******** images ********
+
+  def set_rope_layout(self, images:list[PromptImage]):
+    """
+    M-RoPE (Qwen3-VL/3.5): an image token at row i, column j of its grid gets the positions (t, h, w) = (s, s+i, s+j), s being the
+    position where the image starts, and the text after it continues from s + max(gh, gw), not from s + gh*gw. Every position is a
+    function of the cache index, so instead of passing positions around, the shared RoPE table (one row per cache index, read by
+    every attention layer and the MTP layer) is rewritten in place for the prompt's images, and restored without them.
+    """
+    key = tuple((im.start, im.gh, im.gw) for im in images)
+    if key == self._rope_key: return
+    table = next((b.freqs_cis for b in self.blk if hasattr(b, "freqs_cis")), None)
+    if table is None: return  # no attention layer has run yet (warmup sets them up), and images need M-RoPE sections anyway
+    if self._rope_default is None: self._rope_default = table.clone().realize()
+    if not key: table.assign(self._rope_default).realize()
+    else:
+      import numpy as np
+      assert self.config.rope_sections, "this model has no M-RoPE sections: images are not supported"
+      C, half = self.max_context, table.shape[1] // 2
+      pos = np.tile(np.arange(C, dtype=np.float64), (3, 1))
+      shift = 0
+      for im in images:
+        s, n = im.start + shift, im.gh * im.gw
+        k = np.arange(n)
+        pos[0, im.start:im.end], pos[1, im.start:im.end], pos[2, im.start:im.end] = s, s + k // im.gw, s + k % im.gw
+        shift += max(im.gh, im.gw) - n
+        pos[:, im.end:] = np.arange(im.end, C) + shift
+      # interleaved sections: frequency i follows h if i%3 == 1 (first 3*sections[1]), w if i%3 == 2 (first 3*sections[2]), else t
+      sec = [1 if i % 3 == 1 and i < 3*self.config.rope_sections[1] else 2 if i % 3 == 2 and i < 3*self.config.rope_sections[2] else 0
+             for i in range(half)]
+      inv = 1.0 / (self.config.rope_theta ** (np.arange(0, 2*half, 2, dtype=np.float64) / (2*half)))
+      ang = pos[sec].T * inv  # (C, half)
+      table.assign(Tensor(np.concatenate([np.cos(ang), np.sin(ang)], axis=1).astype(np.float32), device=table.device)).realize()
+    self._rope_key = key
+
+  def _embed_chunk(self, tokens:list[int], lo:int, n:int, pad:int, images:list[PromptImage]) -> Tensor:
+    # input embeddings (1, pad, D) of tokens[lo:lo+n], image rows taken from the images' embeddings
+    x = self.embed(self._spec_input([t if t >= 0 else 0 for t in tokens[lo:lo+n]], pad))
+    for im in images:
+      a, b = max(lo, im.start), min(lo + n, im.end)
+      if a >= b: continue
+      e = im.embeds()[a-im.start:b-im.start]
+      rows = (e.to(x.device) if isinstance(e, Tensor) else Tensor(e, device=x.device)).float().reshape(1, b-a, -1)
+      x = x[:, :a-lo].cat(rows, x[:, b-lo:], dim=1)
+    return x.contiguous().realize()
+
+  @staticmethod
+  def _has_image(images:list[PromptImage], lo:int, hi:int) -> bool: return any(im.start < hi and lo < im.end for im in images)
+
   def _save_checkpoint(self, tokens:list[int]):
     blocks = self._recurrent_blocks()
     if not self._checkpoint_state:
@@ -735,8 +806,11 @@ class Transformer:
       Tensor.realize(b.conv_state.assign(conv), b.recurrent_state.assign(rec))
 
   def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, checkpoint:int|None=None,
-               on_prefill:Callable[[int], None]|None=None):
+               on_prefill:Callable[[int], None]|None=None, images:list[PromptImage]|None=None):
     # on_prefill(start_pos) after each prompt chunk is queued: progress for a status display
+    # images: spans of tokens that are image placeholders (see PromptImage), fed as the images' embeddings
+    images = images or []
+    self.set_rope_layout(images)
     if chunk_size is None: chunk_size = getenv("PREFILL_CHUNK", 32)
     if self.has_recurrent_block and not gated_delta_kernel_supported(self.output_norm.weight.device):
       chunk_size = getenv("RECURRENT_PREFILL_CHUNK", 1)  # the generic scan is unrolled per token, so big chunks make big graphs
@@ -759,13 +833,17 @@ class Transformer:
       if start_pos < len(self._checkpoint_tokens): self._checkpoint_tokens = []
     if checkpoint is not None and not (start_pos < checkpoint < len(tokens)): checkpoint = None
     if self.mtp is not None and getenv("SPEC", 1):
-      yield from self._generate_spec(tokens, start_pos, chunk_size, temp, checkpoint, on_prefill, v_start_pos, v_toks)
+      yield from self._generate_spec(tokens, start_pos, chunk_size, temp, checkpoint, on_prefill, v_start_pos, v_toks, images)
       return
     out, prompt_len = None, len(tokens)
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      if start_pos + n_toks < len(tokens) and n_toks > 1 and getenv("PREFILL_SKIP_HEAD", 1):
+      if start_pos < prompt_len and self._has_image(images, start_pos, start_pos+n_toks):
+        x = self._embed_chunk(tokens, start_pos, n_toks, chunk_size, images)[:, :nt].contiguous()
+        if start_pos + n_toks < len(tokens): self.prefill_body_x_jit(x, sp).realize()
+        else: out = self.prefill_x_jit(x, sp, temp).realize()
+      elif start_pos + n_toks < len(tokens) and n_toks > 1 and getenv("PREFILL_SKIP_HEAD", 1):
         self.prefill_body_jit(inputs(start_pos, n_toks, sp, nt).contiguous(), sp).realize()
       elif start_pos < prompt_len or out is None: out = self(inputs(start_pos, n_toks, sp, nt), sp, temp).realize()
       # decode: feed the sampled token back (on the device, or as its embedding row read from the file)
@@ -785,7 +863,7 @@ class Transformer:
     return Tensor(ids + [0] * (pad_to - len(ids)), dtype="int32", device=self.output_norm.weight.device).reshape(1, pad_to)
 
   def _generate_spec(self, tokens:list[int], start_pos:int, chunk_size:int, temp:Tensor, checkpoint:int|None,
-                     on_prefill:Callable[[int], None]|None, v_start_pos:UOp, v_toks:UOp):
+                     on_prefill:Callable[[int], None]|None, v_start_pos:UOp, v_toks:UOp, images:list[PromptImage]):
     """
     Speculative decoding with the MTP layer as a one-token draft. Each step: the MTP layer drafts d from the last hidden state and
     token x, then the main model runs [x, d] and samples at both positions. The draft is greedy, so taking the target's sample y0
@@ -795,6 +873,7 @@ class Transformer:
     if not hasattr(self, "spec_body_jit"):
       self.spec_body_jit, self.spec_last_jit = TinyJit(self._spec_prefill_body), TinyJit(self._spec_prefill_last)
       self.verify_jit, self.rollback_jit = TinyJit(self.forward_verify), TinyJit(self._rollback)
+      self.spec_body_x_jit, self.spec_last_x_jit = TinyJit(self._spec_prefill_body_x), TinyJit(self._spec_prefill_last_x)
       self.draft_jits = {1: TinyJit(self.forward_draft), 2: TinyJit(self.forward_draft)}
       dim, device = self.output_norm.weight.shape[0], self.output_norm.weight.device
       self.draft_h = {n: Tensor.zeros(1, n, dim, device=device).contiguous().realize() for n in (1, 2)}
@@ -804,10 +883,17 @@ class Transformer:
     while True:
       n_toks = min(chunk_size, prompt_len - start_pos, *([checkpoint - start_pos] if checkpoint is not None and start_pos < checkpoint else []))
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      cur, nxt = self._spec_input(tokens[start_pos:start_pos+n_toks], chunk_size), self._spec_input(tokens[start_pos+1:start_pos+n_toks+1], chunk_size)
       last = start_pos + n_toks == prompt_len
-      if last: x, h, _ = self.spec_last_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp, temp)
-      else: self.spec_body_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp).realize()
+      if self._has_image(images, start_pos, start_pos+n_toks+1):  # this chunk or its next tokens (the MTP layer's input) hold image tokens
+        n_next = min(n_toks, prompt_len - start_pos - 1)
+        cur = self._embed_chunk(tokens, start_pos, n_toks, chunk_size, images)
+        nxt = self._embed_chunk(tokens, start_pos+1, n_next, chunk_size, images)
+        if last: x, h, _ = self.spec_last_x_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp, temp)
+        else: self.spec_body_x_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp).realize()
+      else:
+        cur, nxt = self._spec_input(tokens[start_pos:start_pos+n_toks], chunk_size), self._spec_input(tokens[start_pos+1:start_pos+n_toks+1], chunk_size)
+        if last: x, h, _ = self.spec_last_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp, temp)
+        else: self.spec_body_jit(cur[:, :nt].contiguous(), nxt[:, :nt].contiguous(), sp).realize()
       start_pos += n_toks
       if self.has_recurrent_block and start_pos == checkpoint: self._save_checkpoint(tokens[:checkpoint])
       if last: break
@@ -843,12 +929,16 @@ class Transformer:
         pending_h, pending, mtp_pos, p = h[:, :1], [y0], p, p+1
 
   def _spec_prefill_body(self, tokens:Tensor, next_tokens:Tensor, start_pos:int|UOp) -> Tensor:
-    h = self.forward_hidden(tokens, start_pos)
-    return self.forward_draft_fill(h, next_tokens, start_pos)
+    return self._spec_prefill_body_x(self.embed(tokens), self.embed(next_tokens), start_pos)
+  def _spec_prefill_body_x(self, x:Tensor, next_x:Tensor, start_pos:int|UOp) -> Tensor:
+    h = self.forward_hidden_x(x, start_pos)
+    return cast(MTPHead, self.mtp)(h, next_x, start_pos)[:, -1:, :1].contiguous()
 
   def _spec_prefill_last(self, tokens:Tensor, next_tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    h = self.forward_hidden(tokens, start_pos)
-    fill = self.forward_draft_fill(h, next_tokens, start_pos)
+    return self._spec_prefill_last_x(self.embed(tokens), self.embed(next_tokens), start_pos, temperature)
+  def _spec_prefill_last_x(self, x:Tensor, next_x:Tensor, start_pos:int|UOp, temperature:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    h = self.forward_hidden_x(x, start_pos)
+    fill = cast(MTPHead, self.mtp)(h, next_x, start_pos)[:, -1:, :1].contiguous()
     last = h[:, -1:]
     x = self._sample(self.output(last)[:, -1, :], temperature).reshape(1, 1)
     return x.contiguous(), last.contiguous(), fill

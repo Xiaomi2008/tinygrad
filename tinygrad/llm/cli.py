@@ -1,7 +1,7 @@
 from __future__ import annotations
 import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
 from typing import TYPE_CHECKING
-from tinygrad import nn
+from tinygrad import nn, Device
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv
 from tinygrad.llm.model import Transformer
@@ -151,6 +151,13 @@ def main():
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
 
+  # vision: MMPROJ=<mmproj gguf> loads the image encoder on VISION_DEVICE (default METAL on macOS: off the LLM GPU)
+  vision = None
+  if (mmproj := getenv("MMPROJ", "")):
+    from tinygrad.llm.vision import VisionEncoder
+    vision = VisionEncoder(mmproj, getenv("VISION_DEVICE", "METAL" if sys.platform == "darwin" else Device.DEFAULT))
+    print(f"vision encoder {mmproj} on {vision.device}")
+
   # use the model's chat template if jinja2 is available (enables model-specific formatting)
   template: jinja2.Template|FallbackTemplate = FallbackTemplate(tok)
   if (ct := kv.get('tokenizer.chat_template')) is not None:
@@ -167,10 +174,14 @@ def main():
 
   # warmup the JIT
   if args.warmup or args.serve:
-    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
+    with Context(DEBUG=max(DEBUG.value, 1)):
+      model.warmup()
+      if vision is not None:
+        from tinygrad.llm.vision import warmup
+        warmup(model, vision)
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template, vision).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
