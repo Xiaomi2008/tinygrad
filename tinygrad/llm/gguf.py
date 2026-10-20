@@ -18,8 +18,8 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 
 # quant types {ggml_type: (number of elements, number of bytes)}
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34), 10:(256,84), 11:(256,110),
-               12:(256,144), 13:(256,176), 14:(256,210), 16:(256,66), 17:(256,74), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136),
-               29:(256,56), 39:(32,17), 41:(128,18)}
+               12:(256,144), 13:(256,176), 14:(256,210), 16:(256,66), 20:(32,18), 17:(256,74), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136),
+               29:(256,56), 39:(32,17), 41:(128,18), 42:(64,18)}
 
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
@@ -29,8 +29,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   int16 (id: 25), int32 (id: 26), int64 (id: 27), float64 (id: 28), bfloat16 (id: 30)
   Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q5_0 (id: 6),
   Q5_1 (id: 7), Q8_0 (id: 8), Q2_K (id: 10), Q3_K (id: 11), Q4_K (id: 12), Q5_K (id: 13),
-  Q6_K (id: 14), IQ2_XXS (id: 16), IQ2_XS (id: 17), IQ3_XXS (id: 18), IQ3_S (id: 21), IQ2_S (id: 22), IQ4_XS (id: 23),
-  IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41)
+  Q6_K (id: 14), IQ2_XXS (id: 16), IQ2_XS (id: 17), IQ3_XXS (id: 18), IQ4_NL (id: 20), IQ3_S (id: 21), IQ2_S (id: 22),
+  IQ4_XS (id: 23), IQ1_M (id: 29), MXFP4 (id: 39), Q1_0 (id: 41), Q2_0 (id: 42)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
 
@@ -143,6 +143,15 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       qh = q_to_uint8(blocks[:, 66:74].reshape((-1, 8, 1)), 2).reshape((-1, 32)).cast(dtypes.uint16)
       q = blocks[:, 2:34].cast(dtypes.uint16) + qh.lshift(8)
       return (db * _ggml_iq_grid(t.device, _ggml.iq2s_grid, (1024, 8))[q].reshape((-1, 16, 2, 8)) * signs).flatten(-3)
+    if ggml_type == 20:
+      # IQ4_NL: 32 elements per 18-byte block (d:2, qs:16), low nibbles are elements 0-15, high nibbles 16-31
+      iq4_nl_lut = Tensor(list(_ggml.kvalues_iq4nl), dtype=dtypes.float32, device=t.device)
+      return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * iq4_nl_lut[q_to_uint8(blocks[:,2:], 4)]
+    if ggml_type == 42:
+      # Q2_0: 64 elements per 18-byte block (d:2, qs:16), four 2-bit codes per byte from the low bits up: 0,1,2,3 -> -1,0,1,2
+      shifts = Tensor.const((1, 4, 16, 64), blocks.dtype)
+      q = blocks[:,2:].unsqueeze(-1).div(shifts, rounding_mode="trunc").bitwise_and(3).flatten(-2)
+      return blocks[:,:2].bitcast(dtypes.float16).cast(dtypes.float32) * (q.cast(dtypes.float32) - 1)
     if ggml_type == 23:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
       scale_shifts = Tensor.const((0, 2, 4, 6, 8, 10, 12, 14), dtypes.uint16)

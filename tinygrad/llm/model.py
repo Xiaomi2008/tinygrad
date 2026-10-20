@@ -418,11 +418,12 @@ class GatedDeltaNetBlock(FFNBlock):
       core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
-    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
+    z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda or self.out_gate_sigmoid else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
 
   keep_history = False
+  out_gate_sigmoid = False  # qwen4exp gates the normed output with a sigmoid, Qwen3.5 with silu
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
