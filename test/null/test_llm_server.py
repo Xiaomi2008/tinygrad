@@ -38,6 +38,24 @@ class TestLLMServer(unittest.TestCase):
     cls.server.shutdown()
     cls.server.server_close()
 
+  def test_models_answered_during_generation(self):
+    # a client's model discovery (GET /v1/models, short timeouts) must not wait for a long generation to finish
+    import requests
+    started, release = threading.Event(), threading.Event()
+    def slow(ids, **kwargs):
+      started.set()
+      release.wait(5)
+      yield from [300, 999]
+    with patch.object(self.mock_model, "generate", Mock(side_effect=slow)):
+      chat = threading.Thread(target=lambda: self.client.chat.completions.create(model="test", messages=[{"role": "user", "content": "Hi"}]))
+      chat.start()
+      self.assertTrue(started.wait(5))
+      try:
+        r = requests.get(f"http://127.0.0.1:{self.port}/v1/models", timeout=1)
+        self.assertEqual(r.json()["data"][0]["id"], "test-model")
+      finally: release.set()
+      chat.join(5)
+
   def test_chat_completion_stream(self):
     stream = self.client.chat.completions.create(
       model="test",

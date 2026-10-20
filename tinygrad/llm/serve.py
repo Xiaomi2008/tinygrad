@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, pathlib, re, tempfile, time, typing, uuid
+import json, os, pathlib, re, socketserver, tempfile, threading, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
@@ -183,6 +183,9 @@ class Handler(HTTPRequestHandler):
       raise
 
   def do_POST(self):
+    # one request at a time on the model; GETs (/v1/models) are answered meanwhile, so clients' model discovery doesn't time out
+    with self.server.model_lock: self._post()
+  def _post(self):
     request_st = time.perf_counter()
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  ")
     raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -233,8 +236,10 @@ class Handler(HTTPRequestHandler):
     else:
       raise RuntimeError(f"unhandled path {self.path}")
 
-class LLMServer(TCPServerWithReuse):
+class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
+  daemon_threads = True
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.model_lock = threading.Lock()
     self.status = LiveStatus(model=model_name, max_context=model.max_context)
     super().__init__(server_address, Handler)
